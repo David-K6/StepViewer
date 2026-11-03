@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StepViewer</title>
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{ "imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/": "./vendor/addons/",
+  "three-mesh-bvh": "./vendor/three-mesh-bvh.module.js"
+} }
+</script>
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">STEP<span>Viewer</span></div>
+  <button id="btnOpen" class="btn primary" title="파일 열기 (Ctrl+O)">＋ 열기</button>
+  <input id="fileInput" type="file" multiple accept=".step,.stp,.iges,.igs,.brep,.brp" hidden>
+  <nav id="tabs"></nav>
+  <div class="spacer"></div>
+  <label class="qsel" title="테셀레이션 품질 (새로 여는 파일에 적용)">품질
+    <select id="quality">
+      <option value="draft">빠름</option>
+      <option value="normal" selected>보통</option>
+      <option value="fine">정밀</option>
+    </select>
+  </label>
+  <button id="btnHelp" class="btn icon" title="단축키 (?)">?</button>
+</header>
+
+<div id="main">
+  <aside id="left">
+    <div class="panel-head">
+      <span>모델 트리</span>
+      <div class="row-btns">
+        <button class="btn sm" id="btnShowAll" title="모두 보이기 (Shift+H)">모두 표시</button>
+        <button class="btn sm" id="btnExpandAll" title="모두 펼치기">펼치기</button>
+      </div>
+    </div>
+    <input id="treeFilter" class="search" placeholder="부품 검색…">
+    <div id="tree" class="tree"></div>
+    <div id="props" class="props hidden">
+      <div class="panel-head"><span>선택 항목</span><span id="selCount" class="muted"></span></div>
+      <div id="selName" class="selname"></div>
+      <div id="selInfo" class="selinfo"></div>
+      <label class="slider">투명도
+        <input id="selOpacity" type="range" min="0" max="100" value="100">
+        <span id="selOpacityVal">100%</span>
+      </label>
+      <div class="row-btns">
+        <button class="btn sm" id="btnHideSel" title="숨기기 (H)">숨기기</button>
+        <button class="btn sm" id="btnIsolate" title="이 부품만 보기 (I)">격리</button>
+        <button class="btn sm" id="btnFitSel" title="선택 항목에 맞추기 (F)">맞추기</button>
+        <input type="color" id="selColor" title="색상 변경">
+      </div>
+    </div>
+  </aside>
+  <div id="splitter"></div>
+
+  <section id="viewport">
+    <canvas id="canvas"></canvas>
+    <div id="labels"></div>
+
+    <div id="toolbar">
+      <div class="group">
+        <button class="tool active" data-mode="select" title="선택 (S / Esc)">⬚<small>선택</small></button>
+        <button class="tool" data-mode="distance" title="거리 측정 (D)">↔<small>거리</small></button>
+        <button class="tool" data-mode="angle" title="각도 측정 (A)">∠<small>각도</small></button>
+        <button class="tool" data-mode="radius" title="반경/지름 측정: 원형 모서리 클릭 또는 3점 (R)">◯<small>반경</small></button>
+        <button class="tool" data-mode="face" title="면 정보: 면적/법선 (G)">▱<small>면</small></button>
+      </div>
+      <div class="group">
+        <button class="tool" id="btnSection" title="단면 보기 (X)">◧<small>단면</small></button>
+        <button class="tool" id="btnEdges" title="모서리 표시 (E)">▦<small>모서리</small></button>
+        <button class="tool" id="btnProj" title="원근/직교 투영 전환 (P)">◇<small>원근</small></button>
+      </div>
+      <div class="group">
+        <button class="tool" data-view="fit" title="전체 맞추기 (F / Home)">⤢<small>맞추기</small></button>
+        <button class="tool" data-view="iso" title="등각 (0)">◈<small>등각</small></button>
+        <button class="tool" data-view="front" title="정면 (1)">F<small>정면</small></button>
+        <button class="tool" data-view="back" title="배면 (Ctrl+1)">B<small>배면</small></button>
+        <button class="tool" data-view="top" title="평면 (7)">T<small>평면</small></button>
+        <button class="tool" data-view="bottom" title="저면 (Ctrl+7)">Bo<small>저면</small></button>
+        <button class="tool" data-view="right" title="우측면 (3)">R<small>우측</small></button>
+        <button class="tool" data-view="left" title="좌측면 (Ctrl+3)">L<small>좌측</small></button>
+      </div>
+      <div class="group opacity-group" title="전체 투명도">
+        <span class="lbl">전체 투명도</span>
+        <input id="globalOpacity" type="range" min="5" max="100" value="100">
+        <span id="globalOpacityVal">100%</span>
+      </div>
+    </div>
+
+    <div id="sectionPanel" class="floating hidden">
+      <div class="panel-head"><span>단면</span><button class="btn sm" id="btnSectionReset">초기화</button></div>
+      <div class="sec-row" data-axis="x">
+        <label><input type="checkbox" class="sec-on"> X</label>
+        <input type="range" class="sec-pos" min="0" max="1000" value="500">
+        <input type="number" class="sec-num" step="any">
+        <button class="btn sm sec-flip" title="방향 반전">⇄</button>
+      </div>
+      <div class="sec-row" data-axis="y">
+        <label><input type="checkbox" class="sec-on"> Y</label>
+        <input type="range" class="sec-pos" min="0" max="1000" value="500">
+        <input type="number" class="sec-num" step="any">
+        <button class="btn sm sec-flip" title="방향 반전">⇄</button>
+      </div>
+      <div class="sec-row" data-axis="z">
+        <label><input type="checkbox" class="sec-on"> Z</label>
+        <input type="range" class="sec-pos" min="0" max="1000" value="500">
+        <input type="number" class="sec-num" step="any">
+        <button class="btn sm sec-flip" title="방향 반전">⇄</button>
+      </div>
+      <div class="sec-row" data-axis="c">
+        <label><input type="checkbox" class="sec-on" disabled> 면</label>
+        <input type="range" class="sec-pos" min="0" max="1000" value="500" disabled>
+        <button class="btn sm" id="btnPickPlane" title="모델의 면을 클릭하여 그 면에 평행한 단면 생성">면 선택</button>
+        <button class="btn sm sec-flip" title="방향 반전">⇄</button>
+      </div>
+      <div class="sec-opts">
+        <label><input type="checkbox" id="secCaps" checked> 단면 채우기</label>
+        <label><input type="checkbox" id="secPlanes" checked> 평면 표시</label>
+        <input type="color" id="secColor" value="#e8743b" title="단면 색상">
+      </div>
+    </div>
+
+    <div id="measurePanel" class="floating hidden">
+      <div class="panel-head"><span>측정</span>
+        <div class="row-btns">
+          <label class="muted chk"><input type="checkbox" id="snapOn" checked> 스냅</label>
+          <button class="btn sm" id="btnClearMeasure">모두 지우기</button>
+        </div>
+      </div>
+      <div id="measureHint" class="hint"></div>
+      <div id="measureList" class="mlist"></div>
+    </div>
+
+    <div id="empty" class="empty">
+      <div class="drop-icon">⬡</div>
+      <div class="big">STEP 파일을 여기에 끌어다 놓으세요</div>
+      <div class="muted">.step .stp .iges .igs .brep · 여러 파일을 동시에 열 수 있습니다</div>
+      <button class="btn primary" id="btnOpen2">파일 열기</button>
+    </div>
+    <div id="loading" class="loading hidden"><div class="spinner"></div><div id="loadingText"></div></div>
+    <div id="dropOverlay" class="drop-overlay hidden">놓으면 새 탭으로 열립니다</div>
+    <div id="toast" class="toast hidden"></div>
+  </section>
+</div>
+
+<footer id="status">
+  <span id="stFile">파일 없음</span>
+  <span id="stStats"></span>
+  <span class="spacer"></span>
+  <span id="stCursor" class="mono"></span>
+  <span id="stPerf" class="mono"></span>
+</footer>
+
+<div id="help" class="modal hidden">
+  <div class="modal-body">
+    <h3>조작 방법</h3>
+    <table>
+      <tr><td>왼쪽 드래그</td><td>회전</td></tr>
+      <tr><td>오른쪽/가운데 드래그, Shift+왼쪽</td><td>이동(팬)</td></tr>
+      <tr><td>휠</td><td>커서 위치 기준 확대/축소</td></tr>
+      <tr><td>더블클릭</td><td>클릭 지점을 회전 중심으로</td></tr>
+      <tr><td>클릭 / Ctrl+클릭</td><td>부품 선택 / 다중 선택</td></tr>
+      <tr><td>F / Home</td><td>선택 항목(없으면 전체) 맞추기</td></tr>
+      <tr><td>H / Shift+H</td><td>선택 숨기기 / 모두 표시</td></tr>
+      <tr><td>I</td><td>선택 항목 격리</td></tr>
+      <tr><td>S D A R G</td><td>선택 / 거리 / 각도 / 반경 / 면 정보</td></tr>
+      <tr><td>X / E / P</td><td>단면 / 모서리 / 원근·직교</td></tr>
+      <tr><td>0 1 3 7 (Ctrl: 반대편)</td><td>등각 / 정면 / 우측 / 평면 뷰</td></tr>
+      <tr><td>Ctrl+O / Ctrl+W / Ctrl+Tab</td><td>열기 / 탭 닫기 / 탭 전환</td></tr>
+      <tr><td>Esc</td><td>측정 취소, 선택 해제</td></tr>
+      <tr><td>Delete</td><td>마지막 측정 삭제</td></tr>
+    </table>
+    <button class="btn" id="btnHelpClose">닫기</button>
+  </div>
+</div>
+<script type="module" src="main.js"></script>
+</body>
+</html>

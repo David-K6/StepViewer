@@ -1,0 +1,26 @@
+{
+  "name": "stepviewer",
+  "version": "1.0.0",
+  "description": "Lightweight STEP/IGES viewer (single exe)",
+  "main": "server.js",
+  "scripts": {
+    "prestart": "node scripts/vendor.js",
+    "start": "node server.js",
+    "vendor": "node scripts/vendor.js",
+    "build": "node scripts/build.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "occt-import-js": "^0.0.23",
+    "three": "^0.187.0",
+    "three-mesh-bvh": "^0.9.17"
+  },
+  "devDependencies": {
+    "postject": "^1.0.0-alpha.6",
+    "puppeteer-core": "^25.16.0"
+  }
+}
