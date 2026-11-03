@@ -94,11 +94,58 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     await shot('2-selected');
 
     // hide / show all
+    const hidden0 = await ev(() => window.__sv.active.parts.filter((p) => !p.visible).length); // SolidWorks files may open with hidden parts
     await page.keyboard.press('h');
     const hidden = await ev(() => window.__sv.active.parts.filter((p) => !p.visible).length);
-    check(hidden === 1, 'H hides selected part');
+    check(hidden - hidden0 === 1, 'H hides selected part', `${hidden0} -> ${hidden}`);
     await page.keyboard.down('Shift'); await page.keyboard.press('H'); await page.keyboard.up('Shift');
     check(await ev(() => window.__sv.active.parts.every((p) => p.visible)), 'Shift+H shows all');
+
+    // ---- right-click context menu (click without moving; right drag keeps panning)
+    const menuOpen = () => ev(() => !document.getElementById('ctxMenu').classList.contains('hidden'));
+    const rclick = async (x, y) => { await page.mouse.move(x, y); await page.mouse.down({ button: 'right' }); await page.mouse.up({ button: 'right' }); await wait(120); };
+    const menuItem = (act) => page.click(`#ctxMenu [data-act="${act}"]`);
+    await ev(() => window.__sv.selectParts([]));
+    await rclick(cx, cy);
+    const rsel = await ev(() => [...window.__sv.active.selection].map((p) => p.name));
+    check(await menuOpen() && rsel.length === 1, 'right click on a part selects it and opens the menu', JSON.stringify(rsel));
+    const camBefore = await ev(() => window.__sv.active.camera.position.toArray());
+    await menuItem('hideOthers'); await wait(100);
+    const afterOthers = await ev(() => { const t = window.__sv.active; return { vis: t.parts.filter((p) => p.visible).map((p) => p.name), n: t.parts.length, cam: t.camera.position.toArray() }; });
+    check(!(await menuOpen()) && afterOthers.vis.length === 1 && afterOthers.vis[0] === rsel[0] && afterOthers.cam.every((v, i) => Math.abs(v - camBefore[i]) < 1e-9),
+      'menu "hide others" leaves only the selection visible, camera unchanged', `${afterOthers.vis.length}/${afterOthers.n} visible`);
+    await rclick(cx, cy);
+    await menuItem('hide'); await wait(100);
+    check(await ev(() => window.__sv.active.parts.every((p) => !p.visible) && window.__sv.active.selection.size === 0), 'menu "hide selection" hides the selected part');
+    await rclick(cx, cy);
+    const dis = await ev(() => [...document.querySelectorAll('#ctxMenu button')].map((b) => b.disabled));
+    check(await menuOpen() && dis[0] && dis[1] && !dis[2], 'menu on empty space: hide items disabled, show all enabled', JSON.stringify(dis));
+    await menuItem('showAll'); await wait(100);
+    check(await ev(() => window.__sv.active.parts.every((p) => p.visible)), 'menu "show all" restores every part');
+    const tgt0 = await ev(() => window.__sv.active.target.toArray());
+    await page.mouse.move(cx, cy); await page.mouse.down({ button: 'right' }); await page.mouse.move(cx + 60, cy + 30, { steps: 6 }); await page.mouse.up({ button: 'right' }); await wait(150);
+    const tgt1 = await ev(() => window.__sv.active.target.toArray());
+    check(!(await menuOpen()) && tgt0.some((v, i) => Math.abs(v - tgt1[i]) > 1e-6), 'right drag pans without opening the menu');
+    await ev(() => window.__sv.setView(window.__sv.active, 'iso', false)); await wait(300);
+    await page.mouse.click(cx, cy); // keep a selection, then right click empty space
+    await rclick(box.x + 30, box.y + box.h - 30);
+    const dis2 = await ev(() => [...document.querySelectorAll('#ctxMenu button')].map((b) => b.disabled));
+    check(await menuOpen() && dis2[0] && dis2[1] && (await ev(() => window.__sv.active.selection.size)) === 1, 'empty-space right click with a selection: hide items disabled', JSON.stringify(dis2));
+    await page.keyboard.press('Escape');
+    await page.mouse.move(cx, cy); await page.mouse.down({ button: 'right' }); await page.mouse.move(cx + 90, cy + 30, { steps: 6 }); await page.mouse.move(cx, cy, { steps: 6 }); await page.mouse.up({ button: 'right' }); await wait(150);
+    check(!(await menuOpen()), 'right drag that returns to its start does not open the menu');
+    await ev(() => window.__sv.setView(window.__sv.active, 'iso', false)); await wait(300);
+    await rclick(cx, cy); await page.keyboard.press('Escape'); await wait(80);
+    check(!(await menuOpen()), 'Escape closes the menu');
+    if (await ev(() => window.__sv.active.nodes.length > 1)) {
+      const row = await page.$('#tree .tnode:nth-child(2) .tname');
+      const rb = await row.boundingBox();
+      await page.mouse.click(rb.x + 5, rb.y + rb.height / 2, { button: 'right' }); await wait(120);
+      const tsel = await ev(() => { const t = window.__sv.active; const n = t.nodes[Number(document.querySelector('#tree .tnode:nth-child(2)').dataset.nid)]; return n.partList.length > 0 && n.partList.every((p) => t.selection.has(p)); });
+      check(await menuOpen() && tsel, 'right click in the tree selects that node and opens the menu');
+      await page.keyboard.press('Escape');
+    }
+    await ev(() => window.__sv.selectParts([]));
 
     // distance measure via real clicks
     await page.keyboard.press('d');

@@ -43,8 +43,25 @@ function makePartMaterial(rgb, vertexColors) {
 const BIG_FILE = 8e6, WORKER_IDLE_MS = 30000;
 class ParserPool {
   constructor(max) { this.max = max; this.idle = []; this.all = []; this.queue = []; this.seq = 0; }
-  parse(name, buffer, quality) {
-    return new Promise((resolve, reject) => { this.queue.push({ name, buffer, quality, resolve, reject }); this.pump(); });
+  /** @param resolveFile (fileName) => Promise<ArrayBuffer|null>, used by assemblies for non-embedded references */
+  parse(name, buffer, quality, resolveFile = null, extra = {}, owner = null) {
+    return new Promise((resolve, reject) => { this.queue.push({ name, buffer, quality, resolveFile, extra, owner, resolve, reject }); this.pump(); });
+  }
+  /** abandon the jobs of a closed tab: queued ones are dropped, a running one takes its worker down with it
+   *  (it may be blocked waiting for a referenced file or deep inside OCCT) */
+  cancel(owner) {
+    for (const job of this.queue.filter((j) => j.owner === owner)) {
+      this.queue.splice(this.queue.indexOf(job), 1);
+      job.reject(new Error('cancelled'));
+    }
+    for (const w of this.all.slice()) {
+      const job = w._job;
+      if (!job || job.owner !== owner) continue;
+      w._job = null;
+      this.kill(w);
+      job.reject(new Error('cancelled'));
+    }
+    this.pump();
   }
   kill(w) {
     clearTimeout(w._idleTimer);
@@ -61,7 +78,15 @@ class ParserPool {
       const job = this.queue.shift();
       const id = ++this.seq;
       const bytes = job.buffer.byteLength; // read before transfer detaches the buffer
+      w._job = job;
       w.onmessage = (ev) => {
+        if (w._job !== job) return; // cancelled
+        if (ev.data.need) { // worker asks for a referenced file
+          const reply = (buf) => { if (w._job === job) w.postMessage({ needReply: ev.data.rid, buffer: buf || null }, buf ? [buf] : []); };
+          Promise.resolve(job.resolveFile ? job.resolveFile(ev.data.need) : null).then(reply, () => reply(null));
+          return;
+        }
+        w._job = null;
         if (bytes > BIG_FILE) this.kill(w);
         else {
           this.idle.push(w);
@@ -71,11 +96,13 @@ class ParserPool {
         this.pump();
       };
       w.onerror = (e) => {
+        if (w._job !== job) return;
+        w._job = null;
         this.kill(w);
         job.reject(new Error(e.message || '워커 오류 (메모리 부족일 수 있습니다)'));
         this.pump();
       };
-      w.postMessage({ id, name: job.name, buffer: job.buffer, quality: job.quality }, [job.buffer]);
+      w.postMessage({ id, name: job.name, buffer: job.buffer, quality: job.quality, ...job.extra }, [job.buffer]);
     }
   }
   get workerCount() { return this.all.length; }
@@ -154,6 +181,7 @@ function renderTabs() {
 
 function activateTab(tab) {
   if (active === tab) return;
+  closeContextMenu();
   if (camAnim) { camAnim.step(Infinity); camAnim = null; }
   if (active) {
     cancelPending();
@@ -186,6 +214,7 @@ function closeTab(tab) {
   if (i < 0) return;
   tab.closed = true;
   tabs.splice(i, 1);
+  if (tab.loading) pool.cancel(tab);
   for (const p of tab.parts) {
     p.mesh.geometry.disposeBoundsTree?.();
     p.mesh.geometry.dispose();
@@ -202,11 +231,38 @@ function closeTab(tab) {
 }
 
 // ---------------------------------------------------------------- loading
+const CAD_EXT = /\.(step|stp|iges|igs|brep|brp|sldprt|sldasm)$/i;
+const isAsm = (n) => /\.sldasm$/i.test(n);
+
+/** SolidWorks keeps original reference names ("rear container.SLDPRT") while Pack and Go adds
+ *  suffixes ("rear container_261022.SLDPRT"): exact name first, then "<stem>[_ -]*.<same ext>". */
+function matchRefName(names, want) {
+  const w = want.toLowerCase();
+  const exact = names.find((n) => n.toLowerCase() === w);
+  if (exact) return exact;
+  const dot = w.lastIndexOf('.');
+  const ext = w.slice(dot), stem = w.slice(0, dot);
+  return names.filter((n) => {
+    const l = n.toLowerCase();
+    return l.endsWith(ext) && l.length > w.length && l.startsWith(stem) && '_ -'.includes(l[stem.length]);
+  }).sort((a, b) => a.length - b.length)[0] || null;
+}
+
 async function openFiles(fileList) {
-  for (const f of fileList) {
-    if (!/\.(step|stp|iges|igs|brep|brp)$/i.test(f.name)) { toast(`지원하지 않는 형식: ${f.name}`, true); continue; }
-    loadBuffer(f.name, () => f.arrayBuffer(), f.size);
-  }
+  const files = [...fileList];
+  for (const f of files) if (!CAD_EXT.test(f.name)) toast(`지원하지 않는 형식: ${f.name}`, true);
+  const cad = files.filter((f) => CAD_EXT.test(f.name));
+  // dropping an assembly together with its part files: the other files only serve as references
+  const asms = cad.filter((f) => isAsm(f.name));
+  const open = asms.length ? asms : cad;
+  const refs = asms.length ? cad.filter((f) => !isAsm(f.name)) : [];
+  if (refs.length) toast(`조립품과 함께 놓은 파일 ${refs.length}개는 조립품 참조용으로만 사용합니다.`);
+  const byName = new Map(cad.map((f) => [f.name, f]));
+  const resolveFile = async (want) => {
+    const hit = matchRefName([...byName.keys()], want);
+    return hit ? byName.get(hit).arrayBuffer() : null;
+  };
+  for (const f of open) loadBuffer(f.name, () => f.arrayBuffer(), f.size, resolveFile);
 }
 
 // ---- parsed-model cache (IndexedDB): reopening the same file skips the expensive OCCT step
@@ -252,6 +308,19 @@ async function cachePut(key, data) {
   } catch (e) { console.warn('cache put failed', e); }
 }
 
+/** a cached result must be structurally sound with finite coordinates (never trust stored data blindly) */
+function cachedGeometryOk(r) {
+  if (!r || !Array.isArray(r.meshes) || !r.meshes.length || !r.tree) return false;
+  for (const m of r.meshes) {
+    if (!m || !m.position || !m.index || m.position.length % 3) return false;
+    const p = m.position;
+    for (let i = 0; i < p.length; i++) if (!Number.isFinite(p[i])) return false;
+    const nv = p.length / 3, I = m.index;
+    for (let i = 0; i < I.length; i++) if (I[i] >= nv) return false;
+  }
+  return true;
+}
+
 async function contentHash(buffer) {
   try {
     if (!crypto.subtle) return null;
@@ -260,7 +329,7 @@ async function contentHash(buffer) {
   } catch { return null; }
 }
 
-async function loadBuffer(name, getBuffer, size) {
+async function loadBuffer(name, getBuffer, size, resolveFile = null) {
   const tab = createTab(name);
   activateTab(tab);
   const t0 = performance.now();
@@ -273,12 +342,18 @@ async function loadBuffer(name, getBuffer, size) {
     if (!size) size = buffer.byteLength;
     // cache key = file content hash (not name/mtime), so different files can never collide
     const hash = await contentHash(buffer);
-    const cacheKey = hash ? `v2|${quality}|${buffer.byteLength}|${hash}` : null;
+    const popt = window.__svParseOpts && Object.keys(window.__svParseOpts).length ? '|' + JSON.stringify(window.__svParseOpts) : '';
+    // v3: entries written by older versions (no corrupted-face filtering, cached partial assemblies) are ignored
+    const cacheKey = hash ? `v3|${quality}${popt}|${buffer.byteLength}|${hash}` : null;
     let result = cacheKey ? await cacheGet(cacheKey) : null;
+    // results depending on other files must never come from the cache (older versions could store them)
+    if (result && ((result.missing && result.missing.length) || (result.usedSiblings && result.usedSiblings.length) || !cachedGeometryOk(result))) result = null;
     const fromCache = !!result;
+    if (tab.closed) return;
     if (!result) {
-      result = await pool.parse(name, buffer, quality);
-      if (cacheKey && !tab.closed) cachePut(cacheKey, result);
+      result = await pool.parse(name, buffer, quality, resolveFile, window.__svParseOpts || {}, tab);
+      // results that depend on other files (used or missing ones) change when those files do -> never cache them
+      if (cacheKey && !tab.closed && !(result.usedSiblings && result.usedSiblings.length) && !(result.missing && result.missing.length)) cachePut(cacheKey, result);
     }
     if (tab.closed) return;
     const tParsed = performance.now();
@@ -288,6 +363,14 @@ async function loadBuffer(name, getBuffer, size) {
     tab.loadTimeMs = tBuilt - t0;
     tab.loading = false;
     console.info(`[StepViewer] ${name}: ${tab.loadInfo}`, result.timing);
+    tab.missing = result.missing || [];
+    const warn = [];
+    if (tab.missing.length) {
+      const list = tab.missing.slice(0, 4).join(', ') + (tab.missing.length > 4 ? ` 외 ${tab.missing.length - 4}개` : '');
+      warn.push(`표시 데이터가 없는 부품 ${tab.missing.length}개를 건너뛰었습니다 (${list}). 부품(또는 원본 STEP) 파일을 같은 폴더에 두고 열거나, 조립품과 함께 끌어다 놓으세요.`);
+    }
+    if (result.invalidFaces) warn.push(`손상된 표시 데이터 면 ${result.invalidFaces}개를 건너뛰었습니다. 파일이 손상되었을 수 있습니다.`);
+    if (warn.length) toast(`${name}: ${warn.join(' / ')}`, true);
     if (active === tab) {
       controls.enabled = true;
       $('loading').classList.add('hidden');
@@ -297,6 +380,7 @@ async function loadBuffer(name, getBuffer, size) {
     scheduleBvhBuild(tab);
     requestRender();
   } catch (e) {
+    if (tab.closed) return; // closed while loading (job cancelled)
     console.error(e);
     toast(`${name}: ${e.message}`, true);
     closeTab(tab);
@@ -324,9 +408,10 @@ function buildModel(tab, result) {
     mat.clippingPlanes = tab.clipPlanes;
     const mesh = new THREE.Mesh(geo, mat);
     mesh.matrixAutoUpdate = false;
+    mesh.visible = !m.hidden;
     const part = {
       id: i, name: m.name || '', mesh, material: mat, rgb, hasVertexColors: !!m.colors,
-      visible: true, opacity: 1, edges: m.edges, faceFirst: m.faceFirst, faceLast: m.faceLast,
+      visible: !m.hidden, opacity: 1, edges: m.edges, faceFirst: m.faceFirst, faceLast: m.faceLast,
       triCount: m.index.length / 3, box: geo.boundingBox.clone(), node: null, adj: null,
     };
     mesh.userData.part = part;
@@ -1321,6 +1406,43 @@ function showAll() {
   if (!tab) return;
   setVisible(tab, tab.parts, true);
 }
+/** hide every part that is not selected (camera stays where it is, unlike isolate) */
+function hideOthers() {
+  const tab = active;
+  if (!tab || !tab.selection.size) return;
+  setVisible(tab, tab.parts.filter((p) => !tab.selection.has(p) && p.visible), false);
+}
+
+// ---- context menu (right click without dragging; right drag still pans)
+const ctxMenu = $('ctxMenu');
+/** @param onTarget false when right-clicking empty space: hide items act on the clicked target only */
+function openContextMenu(x, y, onTarget = true) {
+  const tab = active;
+  if (!tab || tab.loading) return;
+  const sel = onTarget ? tab.selection.size : 0;
+  ctxMenu.querySelector('[data-act="hide"]').disabled = !sel;
+  ctxMenu.querySelector('[data-act="hideOthers"]').disabled = !sel || tab.parts.every((p) => tab.selection.has(p) || !p.visible);
+  ctxMenu.querySelector('[data-act="showAll"]').disabled = tab.parts.every((p) => p.visible);
+  ctxMenu.classList.remove('hidden');
+  const r = ctxMenu.getBoundingClientRect();
+  ctxMenu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - r.width - 4))}px`;
+  ctxMenu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - r.height - 4))}px`;
+}
+function closeContextMenu() { $('ctxMenu').classList.add('hidden'); }
+ctxMenu.addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b || b.disabled) return;
+  closeContextMenu();
+  if (b.dataset.act === 'hide') hideSelected();
+  else if (b.dataset.act === 'hideOthers') hideOthers();
+  else if (b.dataset.act === 'showAll') showAll();
+  requestRender();
+});
+ctxMenu.addEventListener('contextmenu', (e) => e.preventDefault());
+window.addEventListener('pointerdown', (e) => { if (!ctxMenu.contains(e.target)) closeContextMenu(); }, true);
+window.addEventListener('wheel', closeContextMenu, { passive: true });
+window.addEventListener('blur', closeContextMenu);
+window.addEventListener('resize', closeContextMenu);
 
 let rowByNode = new Map();
 function renderTree() {
@@ -1394,6 +1516,16 @@ function revealPart(tab, part) {
   if (row) row.scrollIntoView({ block: 'nearest' });
 }
 
+$('tree').addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  const row = e.target.closest('.tnode');
+  const tab = active;
+  if (!row || !tab || tab.loading) return;
+  if (tab.pending) { cancelPending(); return; } // same as on the model: right click aborts an unfinished measurement
+  const n = tab.nodes[Number(row.dataset.nid)];
+  if (n.partList.length && !n.partList.every((p) => tab.selection.has(p))) selectParts(n.partList);
+  openContextMenu(e.clientX, e.clientY);
+});
 $('tree').addEventListener('click', (e) => {
   const row = e.target.closest('.tnode');
   const tab = active;
@@ -1519,16 +1651,19 @@ function toast(msg, err = false) {
 // ---------------------------------------------------------------- pointer interaction
 let down = null;
 let hoverQueued = null;
-canvas.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY, b: e.button, t: performance.now() }; camAnim = null; });
+canvas.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY, b: e.button, t: performance.now(), max: 0 }; camAnim = null; });
 canvas.addEventListener('pointerup', (e) => {
   if (!down) return;
-  const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+  const moved = Math.max(down.max, Math.hypot(e.clientX - down.x, e.clientY - down.y)); // a drag that came back is still a drag
   const b = down.b;
   down = null;
-  if (moved > 4 || b !== 0) return;
+  if (moved > 4) return;
+  if (b === 2) { onRightClick(e); return; }
+  if (b !== 0) return;
   onClick(e);
 });
 canvas.addEventListener('pointermove', (e) => {
+  if (down) down.max = Math.max(down.max, Math.hypot(e.clientX - down.x, e.clientY - down.y));
   if (down && (e.buttons & 7)) { if (active?.hover) { const h = active.hover; active.hover = null; applyPart(active, h); } snapObj.visible = false; return; }
   hoverQueued = e;
 });
@@ -1577,6 +1712,16 @@ function processHover() {
   $('stCursor').textContent = hit ? `X ${fmt(hit.point.x, 2)}  Y ${fmt(hit.point.y, 2)}  Z ${fmt(hit.point.z, 2)}` : '';
 }
 
+/** right click on the model: the part under the cursor becomes the selection unless it already is part of it */
+function onRightClick(e) {
+  const tab = active;
+  if (!tab || tab.loading) return;
+  if (tab.pending) { cancelPending(); return; } // right click also aborts an unfinished measurement
+  const hit = pick(e);
+  if (hit && !tab.selection.has(hit.part)) { selectParts([hit.part]); revealPart(tab, hit.part); }
+  openContextMenu(e.clientX, e.clientY, !!hit);
+}
+
 function onClick(e) {
   const tab = active;
   if (!tab || tab.loading) return;
@@ -1615,6 +1760,7 @@ window.addEventListener('keydown', (e) => {
   }
   if (e.key === '?') { $('help').classList.toggle('hidden'); return; }
   if (e.key === 'Escape') {
+    if (!ctxMenu.classList.contains('hidden')) { closeContextMenu(); return; }
     if (!$('help').classList.contains('hidden')) { $('help').classList.add('hidden'); return; }
     if (active?.pending) cancelPending();
     else if (mode !== 'select') setMode('select');
@@ -1679,7 +1825,10 @@ function connectServer() {
         const r = await fetch(`/api/file/${f.id}`);
         if (!r.ok) throw new Error(`파일을 읽을 수 없습니다 (${r.status})`);
         return r.arrayBuffer();
-      }, f.size);
+      }, f.size, async (want) => { // files next to the opened one (assembly references)
+        const r = await fetch(`/api/sibling/${f.id}?name=${encodeURIComponent(want)}`);
+        return r.status === 200 ? r.arrayBuffer() : null;
+      });
     }
   });
   es.addEventListener('focus', () => window.focus());

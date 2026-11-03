@@ -10,6 +10,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 
 const APP_ID = 'stepviewer-1';
 const PREFERRED_PORT = 47831;
@@ -57,8 +58,32 @@ function getAsset(rel) {
   return buf;
 }
 
+/** Build id = hash of the app files. The app is served under /b/<id>/ so every build has URLs the
+ *  browser has never cached (files cached by an older exe can't shadow the new ones). */
+let buildId = null;
+function getBuildId() {
+  if (buildId) return buildId;
+  if (!sea) return (buildId = 'dev');
+  const h = crypto.createHash('sha1');
+  for (const f of ['index.html', 'main.js', 'worker.js', 'swfile.js', 'style.css', 'vendor/three.module.js', 'vendor/three.core.js',
+    'vendor/three-mesh-bvh.module.js', 'vendor/occt-import-js.js', 'vendor/addons/OrbitControls.js', 'vendor/addons/CSS2DRenderer.js']) {
+    const b = getAsset(f);
+    h.update(f).update(b || '');
+  }
+  return (buildId = h.digest('hex').slice(0, 12));
+}
+const appUrl = (base) => `${base}b/${getBuildId()}/`;
+
+const etags = new Map();
+function assetEtag(rel, buf) {
+  if (sea && etags.has(rel)) return etags.get(rel);
+  const tag = '"' + crypto.createHash('sha1').update(buf).digest('base64url') + '"';
+  if (sea) etags.set(rel, tag);
+  return tag;
+}
+
 // ---- files passed on the command line / forwarded from other instances ----
-const STEP_EXT = /\.(step|stp|iges|igs|brep|brp)$/i;
+const STEP_EXT = /\.(step|stp|iges|igs|brep|brp|sldprt|sldasm)$/i;
 const fileRegistry = new Map(); // id -> absolute path
 let nextFileId = 1;
 const pendingOpen = []; // ids not yet delivered to any client
@@ -76,6 +101,24 @@ function registerFiles(paths) {
     ids.push(id);
   }
   return ids;
+}
+
+/** Find a file referenced by an assembly next to it. SolidWorks keeps the original reference names
+ *  (e.g. "rear container.SLDPRT") while Pack and Go adds suffixes ("rear container_261022.SLDPRT"),
+ *  so an exact (case-insensitive) match is tried first, then "<stem>[_ -]<anything>.<same ext>". */
+function findSibling(dir, want) {
+  if (!want || /[\\/:]/.test(want) || want.includes('..') || !STEP_EXT.test(want)) return null;
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  const w = want.toLowerCase();
+  const exact = names.find((n) => n.toLowerCase() === w);
+  if (exact) return path.join(dir, exact);
+  const ext = path.extname(w), stem = w.slice(0, -ext.length);
+  const cands = names.filter((n) => {
+    const l = n.toLowerCase();
+    return l.endsWith(ext) && l.length > w.length && l.startsWith(stem) && '_ -'.includes(l[stem.length]);
+  }).sort((a, b) => a.length - b.length);
+  return cands.length ? path.join(dir, cands[0]) : null;
 }
 
 function fileInfo(id) {
@@ -158,14 +201,33 @@ function createServer(initialIds) {
         const body = JSON.parse(await readBody(req) || '{}');
         const ids = registerFiles(Array.isArray(body.paths) ? body.paths : []);
         const delivered = clients.size > 0;
-        if (delivered) broadcastOpen(ids); else { pendingOpen.push(...ids); openBrowser(serverUrl); }
+        if (delivered) broadcastOpen(ids); else { pendingOpen.push(...ids); openBrowser(appUrl(serverUrl)); }
         return json(res, 200, { ok: true, ids, delivered });
       }
 
       if (p === '/api/focus' && req.method === 'POST') {
-        if (clients.size === 0) openBrowser(serverUrl);
+        if (clients.size === 0) openBrowser(appUrl(serverUrl));
         for (const c of clients) c.write('event: focus\ndata: {}\n\n');
         return json(res, 200, { ok: true });
+      }
+
+      const sib = /^\/api\/sibling\/(\d+)$/.exec(p);
+      if (sib) {
+        const owner = fileRegistry.get(sib[1]);
+        if (!owner) return json(res, 404, { error: 'unknown file' });
+        let fp = findSibling(path.dirname(owner), url.searchParams.get('name') || '');
+        if (fp) { // no links/junctions out of the folder: the real path must be a regular file in the owner's real folder
+          try {
+            const real = fs.realpathSync(fp);
+            if (path.dirname(real).toLowerCase() !== fs.realpathSync(path.dirname(owner)).toLowerCase() || !fs.statSync(real).isFile()) fp = null;
+            else fp = real;
+          } catch { fp = null; }
+        }
+        if (!fp) { res.writeHead(204, { 'Cache-Control': 'no-store' }); return res.end(); } // not an error: optional reference
+        const st = fs.statSync(fp);
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': st.size, 'Cache-Control': 'no-store', 'X-File-Name': encodeURIComponent(path.basename(fp)) });
+        fs.createReadStream(fp).pipe(res);
+        return;
       }
 
       const m = /^\/api\/file\/(\d+)$/.exec(p);
@@ -179,13 +241,21 @@ function createServer(initialIds) {
       }
 
       if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end(); }
-      const buf = getAsset(p);
+      if (p === '/' || p === '/index.html') { res.writeHead(302, { Location: `/b/${getBuildId()}/`, 'Cache-Control': 'no-store' }); return res.end(); }
+      const bm = /^\/b\/[\w-]+(\/.*)$/.exec(p);
+      const assetPath = bm ? bm[1] : p;
+      const buf = getAsset(assetPath);
       if (!buf) { res.writeHead(404); return res.end('not found'); }
-      const ext = path.extname(p === '/' ? 'index.html' : p).toLowerCase() || '.html';
+      const ext = path.extname(assetPath.endsWith('/') ? 'index.html' : assetPath).toLowerCase() || '.html';
+      // content ETag + no-cache: the browser revalidates every load (cheap 304), so a rebuilt exe is
+      // never shadowed by app files cached from an older version
+      const etag = assetEtag(assetPath, buf);
+      if (req.headers['if-none-match'] === etag) { res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' }); return res.end(); }
       res.writeHead(200, {
         'Content-Type': MIME[ext] || 'application/octet-stream',
         'Content-Length': buf.length,
-        'Cache-Control': sea ? 'max-age=3600' : 'no-store',
+        'Cache-Control': sea ? 'no-cache' : 'no-store',
+        ETag: etag,
       });
       res.end(req.method === 'HEAD' ? undefined : buf);
     } catch (e) {
@@ -226,7 +296,7 @@ function openBrowser(url) {
         `--user-data-dir=${profile}`,
         '--no-first-run',
         '--no-default-browser-check',
-        '--window-size=1600,1000',
+        '--start-maximized',
         '--disable-features=CalculateNativeWinOcclusion',
       ], { detached: true, stdio: 'ignore' }).unref();
     } else {
@@ -358,7 +428,7 @@ async function main() {
   if (!explicitPort) writeInstanceFile(actualPort);
   serverUrl = `http://127.0.0.1:${actualPort}/`;
   log('StepViewer listening on', serverUrl, sea ? '(packaged)' : '(dev)');
-  openBrowser(serverUrl);
+  openBrowser(appUrl(serverUrl));
 
   // If no window ever connects (browser failed to open), don't linger forever.
   setTimeout(() => {

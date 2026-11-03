@@ -17,7 +17,7 @@
 <header id="topbar">
   <div class="brand">STEP<span>Viewer</span></div>
   <button id="btnOpen" class="btn primary" title="파일 열기 (Ctrl+O)">＋ 열기</button>
-  <input id="fileInput" type="file" multiple accept=".step,.stp,.iges,.igs,.brep,.brp" hidden>
+  <input id="fileInput" type="file" multiple accept=".step,.stp,.iges,.igs,.brep,.brp,.sldprt,.sldasm" hidden>
   <nav id="tabs"></nav>
   <div class="spacer"></div>
   <label class="qsel" title="테셀레이션 품질 (새로 여는 파일에 적용)">품질
@@ -140,12 +140,18 @@
     <div id="empty" class="empty">
       <div class="drop-icon">⬡</div>
       <div class="big">STEP 파일을 여기에 끌어다 놓으세요</div>
-      <div class="muted">.step .stp .iges .igs .brep · 여러 파일을 동시에 열 수 있습니다</div>
+      <div class="muted">.step .stp .iges .igs .brep .sldprt .sldasm · 여러 파일을 동시에 열 수 있습니다</div>
       <button class="btn primary" id="btnOpen2">파일 열기</button>
     </div>
     <div id="loading" class="loading hidden"><div class="spinner"></div><div id="loadingText"></div></div>
     <div id="dropOverlay" class="drop-overlay hidden">놓으면 새 탭으로 열립니다</div>
     <div id="toast" class="toast hidden"></div>
+    <div id="ctxMenu" class="ctxmenu hidden" role="menu">
+      <button data-act="hide" role="menuitem">선택 항목 숨기기<span class="k">H</span></button>
+      <button data-act="hideOthers" role="menuitem">선택 항목 이외 나머지 숨기기</button>
+      <div class="sep"></div>
+      <button data-act="showAll" role="menuitem">모두 표시<span class="k">Shift+H</span></button>
+    </div>
   </section>
 </div>
 
@@ -163,6 +169,7 @@
     <table>
       <tr><td>왼쪽 드래그</td><td>회전</td></tr>
       <tr><td>오른쪽/가운데 드래그, Shift+왼쪽</td><td>이동(팬)</td></tr>
+      <tr><td>오른쪽 클릭 (모델·트리)</td><td>메뉴: 선택 항목 숨기기 / 나머지 숨기기 / 모두 표시</td></tr>
       <tr><td>휠</td><td>커서 위치 기준 확대/축소</td></tr>
       <tr><td>더블클릭</td><td>클릭 지점을 회전 중심으로</td></tr>
       <tr><td>클릭 / Ctrl+클릭</td><td>부품 선택 / 다중 선택</td></tr>

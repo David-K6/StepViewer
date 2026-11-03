@@ -118,3 +118,11 @@ input[type=range] { accent-color: var(--acc); }
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: #3a414d; border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+.ctxmenu { position: fixed; z-index: 50; min-width: 220px; padding: 4px; background: #2b3038f8; border: 1px solid #4b5260; border-radius: 6px; box-shadow: 0 6px 20px #0008; }
+.ctxmenu button { display: flex; width: 100%; align-items: center; gap: 16px; padding: 6px 10px; background: none; border: none; border-radius: 4px; color: var(--fg); font: inherit; text-align: left; cursor: pointer; }
+.ctxmenu button:hover:not(:disabled) { background: var(--acc2); }
+.ctxmenu button:disabled { color: #5e6672; cursor: default; }
+.ctxmenu .k { margin-left: auto; color: var(--muted); font-size: 11px; }
+.ctxmenu button:hover:not(:disabled) .k { color: #dbe6ff; }
+.ctxmenu .sep { height: 1px; margin: 4px 2px; background: var(--line); }

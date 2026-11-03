@@ -1,7 +1,7 @@
 /* StepViewer parse worker: runs OpenCascade (occt-import-js WASM) off the UI thread,
  * converts the result to typed arrays and extracts CAD edges (B-rep face boundaries). */
 /* global occtimportjs */
-importScripts('vendor/occt-import-js.js');
+importScripts('vendor/occt-import-js.js', 'swfile.js');
 
 let occtPromise = null;
 function getOcct() {
@@ -20,6 +20,7 @@ const lin = (c) => Math.round(255 * (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.
 
 function formatOf(name) {
   const ext = (name.split('.').pop() || '').toLowerCase();
+  if (ext === 'sldprt' || ext === 'sldasm') return 'solidworks';
   if (ext === 'igs' || ext === 'iges') return 'iges';
   if (ext === 'brep' || ext === 'brp') return 'brep';
   return 'step';
@@ -96,58 +97,106 @@ function extractEdges(pos, idx, faces, triCount) {
   return out;
 }
 
-onmessage = async (ev) => {
-  const { id, name, buffer, quality } = ev.data;
-  const t0 = performance.now();
-  try {
-    const occt = await getOcct();
-    const tInit = performance.now();
-    const q = QUALITY[quality] || QUALITY.normal;
-    const params = { linearUnit: 'millimeter', linearDeflectionType: 'bounding_box_ratio', ...q };
-    const bytes = new Uint8Array(buffer);
-    const fmt = formatOf(name);
-    let res;
-    if (fmt === 'iges') res = occt.ReadIgesFile(bytes, params);
-    else if (fmt === 'brep') res = occt.ReadBrepFile(bytes, params);
-    else res = occt.ReadStepFile(bytes, params);
-    const tParse = performance.now();
-    if (!res || !res.success) throw new Error('파일을 해석하지 못했습니다 (지원되지 않거나 손상된 파일).');
+// ---- file requests to the main thread (assembly references that are not embedded) ----
+const needs = new Map();
+let needSeq = 0;
+function requestFile(jobId, fileName) {
+  return new Promise((resolve) => {
+    const rid = ++needSeq;
+    needs.set(rid, resolve);
+    postMessage({ id: jobId, need: fileName, rid });
+  });
+}
 
-    const transfer = [];
-    const meshes = res.meshes.map((m) => {
-      const position = new Float32Array(m.attributes.position.array);
-      const normal = m.attributes.normal ? new Float32Array(m.attributes.normal.array) : null;
-      const vCount = position.length / 3;
-      const index = vCount < 65536 ? new Uint16Array(m.index.array) : new Uint32Array(m.index.array);
-      const triCount = index.length / 3;
-      const faces = m.brep_faces || [];
-      // per-face colors -> vertex colors only when faces differ from the mesh color
-      let colors = null;
-      const base = m.color || null;
-      const differs = faces.some((f) => f.color && (!base || f.color[0] !== base[0] || f.color[1] !== base[1] || f.color[2] !== base[2]));
-      if (differs) {
-        colors = new Uint8Array(vCount * 3);
-        const fb = (base || [0.72, 0.75, 0.8]).map(lin);
-        for (let v = 0; v < vCount; v++) { colors[v * 3] = fb[0]; colors[v * 3 + 1] = fb[1]; colors[v * 3 + 2] = fb[2]; }
-        for (const f of faces) {
-          if (!f.color) continue;
-          const fc = f.color.map(lin);
-          for (let t = f.first; t <= f.last; t++) {
-            for (let k = 0; k < 3; k++) {
-              const v = index[t * 3 + k];
-              colors[v * 3] = fc[0]; colors[v * 3 + 1] = fc[1]; colors[v * 3 + 2] = fc[2];
-            }
-          }
+/** occt result mesh -> our transferable mesh (positions in mm) */
+function convertOcctMesh(m) {
+  const position = new Float32Array(m.attributes.position.array);
+  const normal = m.attributes.normal ? new Float32Array(m.attributes.normal.array) : null;
+  const vCount = position.length / 3;
+  const index = vCount < 65536 ? new Uint16Array(m.index.array) : new Uint32Array(m.index.array);
+  const faces = m.brep_faces || [];
+  // per-face colors -> vertex colors only when faces differ from the mesh color
+  let colors = null;
+  const base = m.color || null;
+  const differs = faces.some((f) => f.color && (!base || f.color[0] !== base[0] || f.color[1] !== base[1] || f.color[2] !== base[2]));
+  if (differs) {
+    colors = new Uint8Array(vCount * 3);
+    const fb = (base || [0.72, 0.75, 0.8]).map(lin);
+    for (let v = 0; v < vCount; v++) { colors[v * 3] = fb[0]; colors[v * 3 + 1] = fb[1]; colors[v * 3 + 2] = fb[2]; }
+    for (const f of faces) {
+      if (!f.color) continue;
+      const fc = f.color.map(lin);
+      for (let t = f.first; t <= f.last; t++) {
+        for (let k = 0; k < 3; k++) {
+          const v = index[t * 3 + k];
+          colors[v * 3] = fc[0]; colors[v * 3 + 1] = fc[1]; colors[v * 3 + 2] = fc[2];
         }
       }
-      const faceFirst = new Int32Array(faces.length), faceLast = new Int32Array(faces.length);
-      faces.forEach((f, i) => { faceFirst[i] = f.first; faceLast[i] = f.last; });
-      const edges = extractEdges(position, index, faces, triCount);
-      transfer.push(position.buffer, index.buffer, edges.buffer, faceFirst.buffer, faceLast.buffer);
-      if (normal) transfer.push(normal.buffer);
-      if (colors) transfer.push(colors.buffer);
-      return { name: m.name || '', color: base, position, normal, index, colors, edges, faceFirst, faceLast };
-    });
+    }
+  }
+  const faceFirst = new Int32Array(faces.length), faceLast = new Int32Array(faces.length);
+  faces.forEach((f, i) => { faceFirst[i] = f.first; faceLast[i] = f.last; });
+  return { name: m.name || '', color: base, position, normal, index, colors, faceFirst, faceLast };
+}
+
+/** add CAD edges + compact index, collect transferables */
+function finish(meshes) {
+  const transfer = [];
+  for (const m of meshes) {
+    if (m.index.length && m.position.length / 3 < 65536 && !(m.index instanceof Uint16Array)) m.index = Uint16Array.from(m.index);
+    const faces = Array.from(m.faceFirst, (first, i) => ({ first, last: m.faceLast[i] }));
+    m.edges = extractEdges(m.position, m.index, faces, m.index.length / 3);
+    if (m.colors === undefined) m.colors = null;
+    transfer.push(m.position.buffer, m.index.buffer, m.edges.buffer, m.faceFirst.buffer, m.faceLast.buffer);
+    if (m.normal) transfer.push(m.normal.buffer);
+    if (m.colors) transfer.push(m.colors.buffer);
+  }
+  return transfer;
+}
+
+async function readOcct(name, bytes, quality) {
+  const occt = await getOcct();
+  const q = QUALITY[quality] || QUALITY.normal;
+  const params = { linearUnit: 'millimeter', linearDeflectionType: 'bounding_box_ratio', ...q };
+  const fmt = formatOf(name);
+  let res;
+  if (fmt === 'iges') res = occt.ReadIgesFile(bytes, params);
+  else if (fmt === 'brep') res = occt.ReadBrepFile(bytes, params);
+  else res = occt.ReadStepFile(bytes, params);
+  if (!res || !res.success) throw new Error('파일을 해석하지 못했습니다 (지원되지 않거나 손상된 파일).');
+  return res;
+}
+
+onmessage = async (ev) => {
+  if (ev.data.needReply) {
+    const r = needs.get(ev.data.needReply);
+    needs.delete(ev.data.needReply);
+    if (r) r(ev.data.buffer || null);
+    return;
+  }
+  const { id, name, buffer, quality, noCache } = ev.data;
+  const t0 = performance.now();
+  try {
+    const bytes = new Uint8Array(buffer);
+    if (formatOf(name) === 'solidworks') {
+      const readStep = async (buf, sname) => {
+        const res = await readOcct(sname, new Uint8Array(buf), quality);
+        return res.meshes.map(convertOcctMesh);
+      };
+      const r = await SWFile.read(bytes, name, (fname) => requestFile(id, fname), { readStep, noCache });
+      const tParse = performance.now();
+      const transfer = finish(r.meshes);
+      const tEnd = performance.now();
+      postMessage({ id, ok: true, tree: r.tree, meshes: r.meshes, missing: r.missing, usedSiblings: r.usedSiblings, invalidFaces: r.invalidFaces || 0,
+        timing: { init: 0, parse: tParse - t0, post: tEnd - tParse } }, transfer);
+      return;
+    }
+    await getOcct();
+    const tInit = performance.now();
+    const res = await readOcct(name, bytes, quality);
+    const tParse = performance.now();
+    const meshes = res.meshes.map(convertOcctMesh);
+    const transfer = finish(meshes);
     const stripTree = (n) => ({ name: n.name || '', meshes: n.meshes || [], children: (n.children || []).map(stripTree) });
     const tree = stripTree(res.root);
     const tEnd = performance.now();
