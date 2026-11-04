@@ -11,8 +11,9 @@ THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
 const $ = (id) => document.getElementById(id);
 const fmt = (v, d = 3) => (Math.abs(v) < 1e-9 ? 0 : v).toFixed(d);
 const DEFAULT_COLOR = [0.72, 0.75, 0.8];
-const SEL_EMISSIVE = new THREE.Color(0x1f56b8);
-const HOVER_EMISSIVE = new THREE.Color(0x2a2a2a);
+// Highlights tint the part's own color: an added emissive alone does nothing on white/very bright parts.
+const SEL_TINT = new THREE.Color(0x2f7bff), SEL_EMISSIVE = new THREE.Color(0x0a1f4a);
+const HOVER_TINT = new THREE.Color(0x9cc6ff);
 const BLACK = new THREE.Color(0);
 
 // ---------------------------------------------------------------- renderer
@@ -41,6 +42,25 @@ function makePartMaterial(rgb, vertexColors) {
 // Workers hold a WASM heap that never shrinks, so a worker is discarded after a big file
 // and idle workers are released after a short timeout.
 const BIG_FILE = 8e6, WORKER_IDLE_MS = 30000;
+// The worker script, its imports and the OCCT WASM are prefetched once as blobs: workers are created
+// lazily (and discarded after big files), and a later worker must still start when the local server
+// is no longer reachable (e.g. it exited while the window was asleep).
+let workerUrl = 'worker.js';
+const workerAssetsReady = (async () => {
+  if (location.protocol === 'file:') return;
+  try {
+    const blobUrl = async (u, type) => {
+      const r = await fetch(u);
+      if (!r.ok) throw new Error(`${u}: ${r.status}`);
+      return URL.createObjectURL(new Blob([await r.arrayBuffer()], { type }));
+    };
+    const [occt, sw, wasm, wk] = await Promise.all([
+      blobUrl('vendor/occt-import-js.js', 'text/javascript'), blobUrl('swfile.js', 'text/javascript'),
+      blobUrl('vendor/occt-import-js.wasm', 'application/wasm'), blobUrl('worker.js', 'text/javascript')]);
+    const boot = `self.__svAssets=${JSON.stringify({ occt, sw, wasm })};importScripts(${JSON.stringify(wk)});`;
+    workerUrl = URL.createObjectURL(new Blob([boot], { type: 'text/javascript' }));
+  } catch (e) { console.warn('[StepViewer] worker prefetch failed, using the server copy', e); }
+})();
 class ParserPool {
   constructor(max) { this.max = max; this.idle = []; this.all = []; this.queue = []; this.seq = 0; }
   /** @param resolveFile (fileName) => Promise<ArrayBuffer|null>, used by assemblies for non-embedded references */
@@ -72,7 +92,7 @@ class ParserPool {
   pump() {
     while (this.queue.length) {
       let w = this.idle.pop();
-      if (!w && this.all.length < this.max) { w = new Worker('worker.js'); this.all.push(w); }
+      if (!w && this.all.length < this.max) { w = new Worker(workerUrl); this.all.push(w); }
       if (!w) return;
       clearTimeout(w._idleTimer);
       const job = this.queue.shift();
@@ -99,7 +119,7 @@ class ParserPool {
         if (w._job !== job) return;
         w._job = null;
         this.kill(w);
-        job.reject(new Error(e.message || '워커 오류 (메모리 부족일 수 있습니다)'));
+        job.reject(new Error(e.message || '해석 작업자(워커)가 중단되었습니다. 메모리가 부족했을 수 있습니다.'));
         this.pump();
       };
       w.postMessage({ id, name: job.name, buffer: job.buffer, quality: job.quality, ...job.extra }, [job.buffer]);
@@ -127,6 +147,46 @@ controls.zoomSpeed = 1.4;
 controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
 controls.enabled = false;
 controls.addEventListener('change', requestRender);
+
+// Free orbit without the pole limit: OrbitControls clamps the polar angle to [0, π] around camera.up.
+// Instead, drags rotate about the screen's vertical / horizontal axes and camera.up turns along, so the
+// model can be turned over freely. Damping is kept by applying the accumulated rotation gradually.
+const freeRot = { left: 0, up: 0 };
+controls._rotateLeft = (a) => { freeRot.left += a; };
+controls._rotateUp = (a) => { freeRot.up += a; };
+const _Y = new THREE.Vector3(0, 1, 0), _fq = new THREE.Quaternion(), _fq2 = new THREE.Quaternion();
+const _fUp = new THREE.Vector3(), _fRight = new THREE.Vector3(), _fOff = new THREE.Vector3();
+function syncControlsUp() {
+  controls._quat.setFromUnitVectors(controls.object.up, _Y);
+  controls._quatInverse.copy(controls._quat).invert();
+}
+function applyFreeRotation(k) {
+  const l = freeRot.left * k, u = freeRot.up * k;
+  freeRot.left -= l; freeRot.up -= u;
+  if (Math.abs(freeRot.left) < 1e-5) freeRot.left = 0;
+  if (Math.abs(freeRot.up) < 1e-5) freeRot.up = 0;
+  if (Math.abs(l) < 1e-9 && Math.abs(u) < 1e-9) return false;
+  const cam = controls.object;
+  cam.updateMatrixWorld();
+  _fUp.setFromMatrixColumn(cam.matrixWorld, 1).normalize();
+  _fRight.setFromMatrixColumn(cam.matrixWorld, 0).normalize();
+  _fq.setFromAxisAngle(_fUp, -l); // horizontal drag: about the screen's vertical axis
+  _fRight.applyQuaternion(_fq);
+  _fq2.setFromAxisAngle(_fRight, -u); // vertical drag: about the screen's horizontal axis
+  _fq.premultiply(_fq2);
+  _fOff.subVectors(cam.position, controls.target).applyQuaternion(_fq);
+  cam.position.copy(controls.target).add(_fOff);
+  cam.up.copy(_fUp).applyQuaternion(_fq);
+  cam.lookAt(controls.target);
+  syncControlsUp();
+  return true;
+}
+const orbitUpdate = controls.update.bind(controls);
+controls.update = (dt) => {
+  syncControlsUp(); // camera.up may have been changed by views / projection switches
+  const rotated = applyFreeRotation(controls.enableDamping ? controls.dampingFactor : 1);
+  return orbitUpdate(dt) || rotated;
+};
 
 // ---------------------------------------------------------------- tabs
 function createTab(name) {
@@ -412,7 +472,7 @@ function buildModel(tab, result) {
     mesh.matrixAutoUpdate = false;
     mesh.visible = !m.hidden;
     const part = {
-      id: i, name: m.name || '', mesh, material: mat, rgb, hasVertexColors: !!m.colors,
+      id: i, name: m.name || '', mesh, material: mat, baseColor: mat.color.clone(), rgb, hasVertexColors: !!m.colors,
       visible: !m.hidden, opacity: 1, edges: m.edges, faceFirst: m.faceFirst, faceLast: m.faceLast,
       triCount: m.index.length / 3, box: geo.boundingBox.clone(), node: null, adj: null,
     };
@@ -508,8 +568,11 @@ function applyPart(tab, p) {
   m.depthWrite = !m.transparent;
   p.mesh.visible = p.visible && o > 0.004;
   // while the color picker is open, show selected parts in their true color (no highlight tint)
-  const e = tab.selection.has(p) ? (colorEditing ? BLACK : SEL_EMISSIVE) : tab.hover === p ? HOVER_EMISSIVE : BLACK;
-  m.emissive.copy(e);
+  const sel = tab.selection.has(p) && !colorEditing;
+  m.color.copy(p.baseColor);
+  if (sel) m.color.lerp(SEL_TINT, 0.5);
+  else if (tab.hover === p && !tab.selection.has(p)) m.color.lerp(HOVER_TINT, 0.25);
+  m.emissive.copy(sel ? SEL_EMISSIVE : BLACK);
 }
 function refreshParts(tab, list = tab.parts) {
   for (const p of list) applyPart(tab, p);
@@ -598,11 +661,14 @@ function fitParams(tab, box, dir) {
   return { target: sphere.center, pos: sphere.center.clone().addScaledVector(dir, tab.diag * 2), zoom: half / (r * 1.08) };
 }
 
-function animateCamera(tab, toPos, toTarget, toZoom, ms = 280) {
+/** toUp: camera up at the end (named views bring Z back up after free rotation); null keeps it */
+function animateCamera(tab, toPos, toTarget, toZoom, ms = 280, toUp = null) {
   const cam = tab.camera;
+  freeRot.left = freeRot.up = 0;
   if (cam.position.distanceToSquared(tab.target) < 1e-20) ms = 0; // degenerate start (fresh camera)
   if (ms <= 0) {
     camAnim = null;
+    if (toUp) cam.up.copy(toUp);
     tab.target.copy(toTarget);
     cam.position.copy(toPos);
     cam.zoom = toZoom;
@@ -611,7 +677,8 @@ function animateCamera(tab, toPos, toTarget, toZoom, ms = 280) {
     requestRender();
     return;
   }
-  const fromPos = cam.position.clone(), fromTarget = tab.target.clone(), fromZoom = cam.zoom;
+  const fromPos = cam.position.clone(), fromTarget = tab.target.clone(), fromZoom = cam.zoom, fromUp = cam.up.clone();
+  const qUp = toUp ? new THREE.Quaternion().setFromUnitVectors(fromUp, toUp) : null;
   const fromOff = fromPos.clone().sub(fromTarget), toOff = toPos.clone().sub(toTarget);
   const fromDist = fromOff.length(), toDist = toOff.length();
   const q = new THREE.Quaternion().setFromUnitVectors(fromOff.normalize(), toOff.normalize());
@@ -625,6 +692,7 @@ function animateCamera(tab, toPos, toTarget, toZoom, ms = 280) {
     cam.position.copy(tab.target).addScaledVector(dir, fromDist + (toDist - fromDist) * e);
     cam.zoom = fromZoom + (toZoom - fromZoom) * e;
     cam.updateProjectionMatrix();
+    if (qUp) cam.up.copy(fromUp).applyQuaternion(new THREE.Quaternion().slerp(qUp, e)).normalize();
     cam.lookAt(tab.target);
     requestRender();
   }
@@ -646,8 +714,9 @@ function setView(tab, name, animate = true) {
   const sel = name === 'fit' && tab.selection.size ? [...tab.selection] : tab.parts;
   const f = fitParams(tab, visibleBox(tab, sel), dir);
   syncCameraAspect(tab);
-  animateCamera(tab, f.pos, f.target, f.zoom, animate ? 300 : 0);
+  animateCamera(tab, f.pos, f.target, f.zoom, animate ? 300 : 0, name === 'fit' ? null : Z_UP);
 }
+const Z_UP = new THREE.Vector3(0, 0, 1);
 
 function fitSelection() {
   if (!active) return;
@@ -673,7 +742,7 @@ function toggleProjection() {
     tab.camera = tab.persp;
   }
   tab.isOrtho = !tab.isOrtho;
-  tab.camera.up.set(0, 0, 1);
+  tab.camera.up.copy(from.up);
   tab.camera.lookAt(tab.target);
   tab.camera.updateProjectionMatrix();
   controls.object = tab.camera;
@@ -885,6 +954,96 @@ function fitCircleChain(pts) {
   return c;
 }
 
+/** eigen decomposition of a symmetric 3x3 matrix (Jacobi), eigenvalues ascending */
+function eigSym3(A) {
+  const a = A.map((r) => r.slice()), V = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (let sweep = 0; sweep < 50; sweep++) {
+    if (a[0][1] ** 2 + a[0][2] ** 2 + a[1][2] ** 2 < 1e-30) break;
+    for (const [p, q] of [[0, 1], [0, 2], [1, 2]]) {
+      if (Math.abs(a[p][q]) < 1e-300) continue;
+      const th = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+      const t = (th >= 0 ? 1 : -1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+      const c = 1 / Math.sqrt(t * t + 1), sn = t * c;
+      for (let k = 0; k < 3; k++) { const x = a[k][p], y = a[k][q]; a[k][p] = c * x - sn * y; a[k][q] = sn * x + c * y; }
+      for (let k = 0; k < 3; k++) { const x = a[p][k], y = a[q][k]; a[p][k] = c * x - sn * y; a[q][k] = sn * x + c * y; }
+      for (let k = 0; k < 3; k++) { const x = V[k][p], y = V[k][q]; V[k][p] = c * x - sn * y; V[k][q] = sn * x + c * y; }
+    }
+  }
+  const ids = [0, 1, 2].sort((i, j) => a[i][i] - a[j][j]);
+  return { values: ids.map((i) => a[i][i]), vectors: ids.map((i) => new THREE.Vector3(V[0][i], V[1][i], V[2][i]).normalize()) };
+}
+
+/** The clicked B-rep face as a cylinder (full, half or partial): axis = the direction all vertex normals are
+ *  perpendicular to, radius/center = circle fit of the vertices projected along it. null if not a cylinder. */
+function fitCylinderFace(tab, hit) {
+  const part = hit.part;
+  const f = brepFaceOf(part, hit.tri);
+  if (f < 0) return null;
+  const g = part.mesh.geometry;
+  const pos = g.getAttribute('position').array, nrmA = g.getAttribute('normal'), idx = g.getIndex().array;
+  if (!nrmA) return null;
+  const nrm = nrmA.array;
+  const seen = new Set(), P = [], N = [];
+  for (let t = part.faceFirst[f]; t <= part.faceLast[f]; t++) {
+    for (let k = 0; k < 3; k++) {
+      const v = idx[t * 3 + k];
+      if (seen.has(v)) continue;
+      seen.add(v);
+      const n = new THREE.Vector3().fromArray(nrm, v * 3);
+      if (n.lengthSq() < 1e-12) continue;
+      P.push(new THREE.Vector3().fromArray(pos, v * 3)); N.push(n.normalize());
+    }
+  }
+  if (P.length < 6) return null;
+  const M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (const n of N) { const a = [n.x, n.y, n.z]; for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) M[i][j] += a[i] * a[j]; }
+  const { values, vectors } = eigSym3(M);
+  const cnt = N.length;
+  if (values[1] / cnt < 0.003) return null; // normals do not turn: plane (or a sliver of an arc)
+  if (values[0] / cnt > 0.002) return null; // normals are not all perpendicular to one axis: cone, sphere, torus...
+  const axis = vectors[0];
+  const u = new THREE.Vector3().crossVectors(axis, Math.abs(axis.x) < 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0)).normalize();
+  const w = new THREE.Vector3().crossVectors(axis, u);
+  const c0 = new THREE.Vector3();
+  for (const p of P) c0.add(p);
+  c0.divideScalar(P.length);
+  // algebraic circle fit (Kasa) in the plane perpendicular to the axis
+  let sxx = 0, sxy = 0, syy = 0, sx = 0, sy = 0, sxz = 0, syz = 0, sz = 0;
+  const XY = P.map((p) => { const d = _v1.copy(p).sub(c0); return [d.dot(u), d.dot(w)]; });
+  for (const [x, y] of XY) { const z = x * x + y * y; sxx += x * x; sxy += x * y; syy += y * y; sx += x; sy += y; sxz += x * z; syz += y * z; sz += z; }
+  const m = [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, XY.length]], rhs = [-sxz, -syz, -sz];
+  const det3 = (q) => q[0][0] * (q[1][1] * q[2][2] - q[1][2] * q[2][1]) - q[0][1] * (q[1][0] * q[2][2] - q[1][2] * q[2][0]) + q[0][2] * (q[1][0] * q[2][1] - q[1][1] * q[2][0]);
+  const D0 = det3(m);
+  if (!Number.isFinite(D0) || Math.abs(D0) < 1e-300) return null;
+  const sol = [0, 1, 2].map((c) => det3(m.map((row, r) => row.map((x, k) => (k === c ? rhs[r] : x)))) / D0);
+  const cx = -sol[0] / 2, cy = -sol[1] / 2, r = Math.sqrt(cx * cx + cy * cy - sol[2]);
+  if (!Number.isFinite(r) || r <= 0 || r > tab.diag * 10) return null;
+  const tol = Math.max(r * 0.005, tab.diag * 1e-6);
+  let a0 = Infinity, a1 = -Infinity;
+  // radius as a linear function of the axial position: a cone (even a very flat one) has a slope
+  let sh = 0, shh = 0, sr = 0, shr = 0;
+  for (let i = 0; i < P.length; i++) {
+    const [x, y] = XY[i];
+    const rad = Math.hypot(x - cx, y - cy);
+    if (Math.abs(rad - r) > tol) return null;
+    // normals of a cylinder are radial and exactly perpendicular to the axis (0.17°)
+    if (Math.abs(N[i].dot(axis)) > 0.003) return null;
+    const radial = _v2.copy(u).multiplyScalar((x - cx) / rad).addScaledVector(w, (y - cy) / rad);
+    if (Math.abs(radial.dot(N[i])) < 0.95) return null;
+    const h = _v1.copy(P[i]).sub(c0).dot(axis);
+    a0 = Math.min(a0, h); a1 = Math.max(a1, h);
+    sh += h; shh += h * h; sr += rad; shr += h * rad;
+  }
+  const varH = shh / P.length - (sh / P.length) ** 2;
+  if (varH > 1e-12) {
+    const slope = (shr / P.length - (sh / P.length) * (sr / P.length)) / varH;
+    if (Math.abs(slope) > 0.002) return null; // radius changes along the axis -> cone
+  }
+  const base = c0.clone().addScaledVector(u, cx).addScaledVector(w, cy);
+  const center = base.clone().addScaledVector(axis, _v1.copy(hit.point).sub(c0).dot(axis));
+  return { center, radius: r, normal: axis, p0: base.clone().addScaledVector(axis, a0), p1: base.clone().addScaledVector(axis, a1), length: a1 - a0 };
+}
+
 function brepFaceOf(part, tri) {
   const f = part.faceFirst, l = part.faceLast;
   let lo = 0, hi = f.length - 1;
@@ -932,7 +1091,7 @@ snapObj.visible = false;
 const HINTS = {
   distance: '두 점을 클릭하세요. 꼭짓점(분홍)·모서리(파랑)에 자동 스냅 — Shift를 누르면 스냅 해제. 두 면이 평행하면 면간 거리도 표시합니다.',
   angle: '세 점을 클릭: 시작점 → 각의 꼭짓점 → 끝점. (두 평면 사이 각도는 면 위 아무 점이나 찍어도 면 법선으로 함께 계산)',
-  radius: '원/호 모서리를 클릭하면 반경·지름·중심을 측정합니다. 원형이 아닌 곳은 원주 위 3점을 클릭하세요.',
+  radius: '원/호 모서리나 원통(반원통) 면을 클릭하면 반경·지름·중심을 측정합니다. 그 밖의 곳은 원주 위 3점을 클릭하세요.',
   face: '면을 클릭하면 면적, 법선(평면인 경우), 중심을 표시합니다.',
   pickplane: '단면 기준이 될 면을 클릭하세요. (Esc 취소)',
 };
@@ -1044,16 +1203,19 @@ function arcObj(a, v, b) {
   return mkLine(pts);
 }
 
-function addCircleMeasure(tab, circ, onPt, how) {
+function addCircleMeasure(tab, circ, onPt, how, extraLines = [], extraObjs = []) {
   const { center, radius, normal } = circ;
   const pts = [];
   const u = onPt.clone().sub(center).normalize();
   for (let i = 0; i < 64; i++) pts.push(center.clone().addScaledVector(u.clone().applyAxisAngle(normal, (i / 64) * Math.PI * 2), radius));
   const lines = [`<b>Ø ${fmt(radius * 2)} mm</b>  R ${fmt(radius)} mm`,
     `중심 (${fmt(center.x)}, ${fmt(center.y)}, ${fmt(center.z)})`,
-    `축 (${fmt(normal.x, 4)}, ${fmt(normal.y, 4)}, ${fmt(normal.z, 4)}) · ${how}`];
+    `축 (${fmt(normal.x, 4)}, ${fmt(normal.y, 4)}, ${fmt(normal.z, 4)}) · ${how}`, ...extraLines];
+  const rim = onPt.clone().sub(center);
+  rim.addScaledVector(normal, -rim.dot(normal));
+  const onCircle = rim.lengthSq() > 1e-18 ? center.clone().addScaledVector(rim.normalize(), radius) : onPt;
   addMeasure(tab, 'radius', lines, `Ø${fmt(radius * 2)} R${fmt(radius)}`, center,
-    [mkLine(pts, true), mkLine([center, onPt]), mkPoints([center, onPt])]);
+    [mkLine(pts, true), mkLine([center, onCircle]), mkPoints([center, onCircle]), ...extraObjs]);
 }
 
 function faceMeasure(tab, hit) {
@@ -1255,6 +1417,7 @@ function applySection(tab) {
   const s = tab.section;
   tab.clipPlanes.length = 0;
   disposeSectionObjs(tab);
+  tab.sectionHandles = [];
   const center = tab.box.getCenter(new THREE.Vector3());
   const size = tab.diag * 0.42;
   for (const ax of ['x', 'y', 'z', 'c']) {
@@ -1275,6 +1438,7 @@ function applySection(tab) {
       const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geo), planeEdgeMat);
       edge.position.copy(onPlane); edge.quaternion.copy(q);
       tab.sectionPlaneObjs.add(fill, edge);
+      tab.sectionHandles.push({ ax, n, origin: onPlane.clone(), u: new THREE.Vector3(1, 0, 0).applyQuaternion(q), v: new THREE.Vector3(0, 1, 0).applyQuaternion(q), half: size });
     }
   }
   if (s.caps) {
@@ -1346,6 +1510,71 @@ function toggleSectionPanel(force) {
   syncSectionUI();
 }
 $('btnSection').onclick = () => toggleSectionPanel();
+
+/** section plane under the cursor (select mode, section panel open, planes shown) that is not hidden
+ *  behind a model surface -> { ax, n, point, t } */
+function sectionHandleAt(e, hit) {
+  const tab = active;
+  if (!tab || tab.loading || mode !== 'select' || !tab.section || !tab.section.showPlanes || !tab.sectionHandles?.length) return null;
+  if ($('sectionPanel').classList.contains('hidden')) return null;
+  setRayFromEvent(e);
+  const ray = raycaster.ray;
+  let best = null;
+  for (const h of tab.sectionHandles) {
+    const pt = ray.intersectPlane(_secPlane.setFromNormalAndCoplanarPoint(h.n, h.origin), new THREE.Vector3());
+    if (!pt) continue;
+    const d = _v1.copy(pt).sub(h.origin);
+    if (Math.abs(d.dot(h.u)) > h.half || Math.abs(d.dot(h.v)) > h.half) continue;
+    const t = pt.distanceTo(ray.origin);
+    if (hit && hit.distance < t - tab.diag * 1e-4) continue; // a model surface is in front of the plane
+    if (!best || t < best.t) best = { ax: h.ax, n: h.n.clone(), point: pt, t };
+  }
+  return best;
+}
+const _secPlane = new THREE.Plane();
+let planeDrag = null;
+function dragSectionTo(e) {
+  const d = planeDrag, tab = d.tab;
+  if (active !== tab) return;
+  setRayFromEvent(e);
+  const ray = raycaster.ray;
+  const view = tab.camera.getWorldDirection(_v2);
+  let s;
+  if (Math.abs(view.dot(d.n)) < 0.9) {
+    // closest point of the line (grab point + n*s) to the mouse ray
+    const w0 = _v1.copy(d.point).sub(ray.origin);
+    const b = d.n.dot(ray.direction);
+    s = (b * ray.direction.dot(w0) - d.n.dot(w0)) / Math.max(1 - b * b, 1e-9);
+  } else {
+    // looking (almost) along the normal: vertical mouse motion moves the plane toward / away from the viewer
+    s = (d.sy - e.clientY) * worldPerPixel(tab, d.point) * (view.dot(d.n) < 0 ? 1 : -1);
+  }
+  const [lo, hi] = axisRange(tab, d.ax);
+  d.next = Math.min(hi, Math.max(lo, d.startPos + s));
+  if (!d.raf) d.raf = requestAnimationFrame(() => {
+    d.raf = 0;
+    if (active !== d.tab || !d.tab.section) return;
+    d.tab.section[d.ax].pos = d.next;
+    applySection(d.tab); syncSectionUI();
+  });
+}
+viewportEl.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || e.target !== canvas || e.shiftKey || e.ctrlKey) return;
+  const h = sectionHandleAt(e, pick(e));
+  if (!h) return;
+  // grab the plane: OrbitControls (listening on the canvas) must not start rotating
+  e.stopPropagation();
+  e.preventDefault();
+  canvas.setPointerCapture(e.pointerId);
+  planeDrag = { tab: active, ax: h.ax, n: h.n, point: h.point, sy: e.clientY, startPos: active.section[h.ax].pos, next: null, raf: 0, id: e.pointerId };
+  camAnim = null;
+}, { capture: true });
+function endPlaneDrag(e) {
+  if (!planeDrag || (e && e.pointerId !== planeDrag.id)) return false;
+  try { canvas.releasePointerCapture(planeDrag.id); } catch { /* already released */ }
+  planeDrag = null;
+  return true;
+}
 
 function pickPlaneFromHit(tab, hit) {
   const n = hit.normal.clone().normalize();
@@ -1582,7 +1811,7 @@ function updateProps() {
   const op = Math.round(sel[0].opacity * 100);
   $('selOpacity').value = op;
   $('selOpacityVal').textContent = op + '%';
-  const c = sel[0].material.color.clone();
+  const c = sel[0].baseColor.clone();
   $('selColor').value = '#' + (sel[0].hasVertexColors ? new THREE.Color().setRGB(...DEFAULT_COLOR, THREE.SRGBColorSpace) : c).getHexString();
 }
 $('selOpacity').oninput = (e) => {
@@ -1598,10 +1827,11 @@ $('selColor').oninput = (e) => {
   if (!tab) return;
   const c = new THREE.Color(e.target.value);
   for (const p of tab.selection) {
-    p.material.color.copy(c);
+    p.baseColor.copy(c);
     if (p.hasVertexColors) { p.material.vertexColors = false; p.hasVertexColors = false; p.material.needsUpdate = true; }
     const s = c.clone().convertLinearToSRGB();
     p.rgb = [s.r, s.g, s.b];
+    applyPart(tab, p);
   }
   renderTree();
   requestRender();
@@ -1642,7 +1872,13 @@ document.querySelectorAll('#toolbar [data-mode]').forEach((b) => { b.onclick = (
 document.querySelectorAll('#toolbar [data-view]').forEach((b) => { b.onclick = () => active && !active.loading && setView(active, b.dataset.view); });
 $('btnEdges').onclick = () => { if (!active) return; active.showEdges = !active.showEdges; active.edgeDirty = true; syncToolbar(); requestRender(); };
 $('btnProj').onclick = toggleProjection;
-$('btnClearMeasure').onclick = () => { if (!active) return; for (const m of active.measures) disposeMeasure(m); active.measures = []; renderMeasureList(); requestRender(); };
+function clearMeasures(tab) {
+  for (const m of tab.measures) disposeMeasure(m);
+  tab.measures = [];
+  renderMeasureList();
+  requestRender();
+}
+$('btnClearMeasure').onclick = () => { if (active) clearMeasures(active); };
 
 function updateStatus() {
   const tab = active;
@@ -1668,6 +1904,7 @@ let down = null;
 let hoverQueued = null;
 canvas.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY, b: e.button, t: performance.now(), max: 0 }; camAnim = null; });
 canvas.addEventListener('pointerup', (e) => {
+  if (endPlaneDrag(e)) return;
   if (!down) return;
   const moved = Math.max(down.max, Math.hypot(e.clientX - down.x, e.clientY - down.y)); // a drag that came back is still a drag
   const b = down.b;
@@ -1677,7 +1914,9 @@ canvas.addEventListener('pointerup', (e) => {
   if (b !== 0) return;
   onClick(e);
 });
+canvas.addEventListener('pointercancel', (e) => { endPlaneDrag(e); });
 canvas.addEventListener('pointermove', (e) => {
+  if (planeDrag) { if (e.pointerId === planeDrag.id) dragSectionTo(e); return; }
   if (down) down.max = Math.max(down.max, Math.hypot(e.clientX - down.x, e.clientY - down.y));
   if (down && (e.buttons & 7)) { if (active?.hover) { const h = active.hover; active.hover = null; applyPart(active, h); } snapObj.visible = false; return; }
   hoverQueued = e;
@@ -1714,6 +1953,7 @@ function processHover() {
       requestRender();
     }
     canvas.title = p ? p.name : '';
+    canvas.style.cursor = sectionHandleAt(e, hit) ? 'move' : '';
   } else {
     if (mode === 'distance' || mode === 'angle' || mode === 'radius') hit = snapHit(hit, e);
     if (hit) {
@@ -1759,6 +1999,14 @@ function onClick(e) {
     const circ = fitCircleChain(chain.pts);
     if (circ) { addCircleMeasure(tab, circ, hit.point, chain.closed ? '원' : '호'); return; }
   }
+  // a click on a cylindrical (or partial cylindrical) face measures that cylinder
+  if (mode === 'radius' && !tab.pending && !hit.cap) {
+    const cyl = fitCylinderFace(tab, hit);
+    if (cyl) {
+      addCircleMeasure(tab, cyl, hit.point, '원통면', [`원통 길이 ${fmt(cyl.length)} mm`], [mkLine([cyl.p0, cyl.p1])]);
+      return;
+    }
+  }
   addPendingPoint(hit);
 }
 
@@ -1777,6 +2025,7 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (!ctxMenu.classList.contains('hidden')) { closeContextMenu(); return; }
     if (!$('help').classList.contains('hidden')) { $('help').classList.add('hidden'); return; }
+    if (!$('updateDlg').classList.contains('hidden')) { if (!updBusy) $('updateDlg').classList.add('hidden'); return; }
     if (active?.pending) cancelPending();
     else if (mode !== 'select') setMode('select');
     else selectParts([]);
@@ -1801,11 +2050,18 @@ window.addEventListener('keydown', (e) => {
     case 'g': setMode('face'); break;
     case 'x': toggleSectionPanel(); break;
     case 'e': $('btnEdges').click(); break;
+    case 'o': $('btnOrigin').click(); break;
     case 'p': toggleProjection(); break;
     case '0': setView(active, 'iso'); break;
     case '1': setView(active, 'front'); break;
     case '3': setView(active, 'right'); break;
     case '7': setView(active, 'top'); break;
+    case 'c':
+      if (!e.shiftKey) return;
+      cancelPending();
+      clearMeasures(active);
+      selectParts([]);
+      break;
     case 'delete': case 'backspace':
       if (active.measures.length) removeMeasure(active, active.measures[active.measures.length - 1]);
       break;
@@ -1829,11 +2085,118 @@ window.addEventListener('drop', (e) => {
   openFiles([...e.dataTransfer.files]);
 });
 $('btnHelp').onclick = () => $('help').classList.remove('hidden');
+
+// ---------------------------------------------------------------- update check / self update
+// The local server asks GitHub for the latest release; the update downloads the new exe, swaps it in and
+// restarts. This window then waits for the new server and reloads itself.
+const updFetch = (u, o = {}) => fetch(u, { cache: 'no-store', ...o, headers: { 'X-StepViewer': '1', ...(o.headers || {}) } });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let updBusy = false;
+function updMsg(text, err = false) { const m = $('updMsg'); m.textContent = text; m.classList.toggle('err', err); }
+async function checkUpdate() {
+  if (updBusy) return;
+  $('updLatest').textContent = '확인 중…';
+  $('btnUpdApply').disabled = true;
+  updMsg('');
+  try {
+    const r = await (await updFetch('/api/update/check')).json();
+    $('updCurrent').textContent = r.current || '-';
+    if (r.url) $('updLink').href = r.url;
+    if (r.error) { $('updLatest').textContent = '-'; updMsg(r.error, true); return; }
+    $('updLatest').textContent = r.latest;
+    if (!r.newer) updMsg('최신 버전을 사용 중입니다.');
+    else if (!r.canUpdate) updMsg(`새 버전 ${r.latest}이(가) 있지만 자동 업데이트할 수 없습니다: ${r.reason || ''} 릴리즈 페이지에서 받아 주세요.`, true);
+    else {
+      updMsg(`새 버전 ${r.latest}이(가) 있습니다. 업데이트하면 프로그램이 다시 시작되며 열려 있는 파일은 닫힙니다.`);
+      $('btnUpdApply').disabled = false;
+    }
+  } catch (e) {
+    $('updLatest').textContent = '-';
+    updMsg(`업데이트 정보를 가져오지 못했습니다: ${e.message || e}`, true);
+  }
+}
+async function applyUpdate() {
+  if (updBusy) return;
+  updBusy = true;
+  for (const b of ['btnUpdApply', 'btnUpdCheck']) $(b).disabled = true;
+  $('updProgress').classList.remove('hidden');
+  $('updBar').style.width = '0%';
+  updMsg('새 버전을 받는 중…');
+  let oldPid = null;
+  try { oldPid = (await (await fetch('/api/hello', { cache: 'no-store' })).json()).pid; } catch { /* ignore */ }
+  try {
+    await updFetch('/api/update/start', { method: 'POST' });
+    let restarting = 0;
+    $('btnUpdClose').textContent = '취소';
+    $('btnUpdClose').disabled = false;
+    for (;;) {
+      await sleep(400);
+      let st = null;
+      try { st = await (await updFetch('/api/update/status')).json(); } catch { st = null; }
+      if (!st) { if (restarting) break; continue; } // the old server is gone once it hands over
+      if (restarting && Date.now() - restarting > 20000) throw new Error('다시 시작이 끝나지 않았습니다.');
+      $('btnUpdClose').disabled = st.phase !== 'downloading';
+      if (st.phase === 'downloading' && st.total) {
+        $('updBar').style.width = `${Math.min(100, (st.received / st.total) * 100).toFixed(1)}%`;
+        updMsg(`새 버전 ${st.version} 받는 중… ${(st.received / 1048576).toFixed(1)} / ${(st.total / 1048576).toFixed(1)} MB`);
+      } else if (st.phase === 'verifying') {
+        $('updBar').style.width = '100%';
+        updMsg(`받은 파일 확인 중…`);
+      } else if (st.phase === 'error') {
+        updMsg(st.error || '업데이트에 실패했습니다.', true);
+        $('updProgress').classList.add('hidden');
+        updDone();
+        return;
+      } else if (st.phase === 'restarting') {
+        if (!restarting) restarting = Date.now();
+        $('updBar').style.width = '100%';
+        updMsg(`${st.version}(으)로 다시 시작하는 중…`);
+      }
+    }
+    // wait for the new version's server, then load its app
+    for (const t0 = Date.now(); Date.now() - t0 < 30000;) {
+      await sleep(700);
+      try {
+        const h = await (await fetch('/api/hello', { cache: 'no-store' })).json();
+        if (h && h.pid !== oldPid) { location.href = '/'; return; }
+      } catch { /* not up yet */ }
+    }
+    updMsg('새 버전이 시작되지 않았습니다. 이 창을 닫고 StepViewer를 다시 실행해 주세요.', true);
+  } catch (e) {
+    updMsg(`업데이트에 실패했습니다: ${e.message || e}`, true);
+    $('updProgress').classList.add('hidden');
+    updDone();
+  }
+}
+function updDone() {
+  updBusy = false;
+  $('btnUpdCheck').disabled = false;
+  $('btnUpdClose').disabled = false;
+  $('btnUpdClose').textContent = '닫기';
+}
+$('btnUpdate').onclick = () => { $('updateDlg').classList.remove('hidden'); checkUpdate(); };
+$('btnUpdCheck').onclick = checkUpdate;
+$('btnUpdApply').onclick = applyUpdate;
+$('btnUpdClose').onclick = () => {
+  if (updBusy) { updFetch('/api/update/cancel', { method: 'POST' }).catch(() => {}); return; } // '취소' while downloading
+  $('updateDlg').classList.add('hidden');
+};
+if (location.protocol === 'file:') $('btnUpdate').classList.add('hidden');
 $('btnHelpClose').onclick = () => $('help').classList.add('hidden');
 
 function connectServer() {
   if (location.protocol === 'file:') return;
-  const es = new EventSource('/api/events');
+  // the id ties the goodbye beacon to this window's event stream (server: closed vs. merely dropped)
+  const cid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const es = new EventSource(`/api/events?cid=${cid}`);
+  let bootVersion = null;
+  es.addEventListener('open', async () => {
+    try {
+      const h = await (await fetch('/api/hello', { cache: 'no-store' })).json();
+      if (bootVersion === null) bootVersion = h.version;
+      else if (h.version !== bootVersion) location.href = '/';
+    } catch { /* ignore */ }
+  });
   es.addEventListener('openfiles', (ev) => {
     for (const f of JSON.parse(ev.data)) {
       loadBuffer(f.name, async () => {
@@ -1847,6 +2210,7 @@ function connectServer() {
     }
   });
   es.addEventListener('focus', () => window.focus());
+  window.addEventListener('pagehide', () => { try { navigator.sendBeacon(`/api/bye?cid=${cid}`); } catch { /* ignore */ } });
 }
 connectServer();
 
@@ -1878,7 +2242,13 @@ function drawTriad(cam) {
     tctx.strokeStyle = c; tctx.lineWidth = 2.5;
     tctx.beginPath(); tctx.moveTo(45, 45); tctx.lineTo(x, y); tctx.stroke();
     tctx.fillStyle = c; tctx.font = 'bold 12px Segoe UI';
-    tctx.fillText(n, x + (v.x >= 0 ? 3 : -11), y + (v.y >= 0 ? -3 : 11));
+    tctx.textAlign = 'center'; tctx.textBaseline = 'middle';
+    // continue along the axis; when the axis points at the viewer (short on screen) blend towards a
+    // fixed upper-right offset, so the label never flips sides
+    // w * (v / L) equals v / 0.35 below L = 0.35, so the offset is a continuous function of the axis
+    const L = Math.hypot(v.x, v.y), w = Math.min(1, L / 0.35);
+    const dx = w * (L > 1e-6 ? v.x / L : 0) + (1 - w) * 0.7071, dy = w * (L > 1e-6 ? -v.y / L : 0) - (1 - w) * 0.7071;
+    tctx.fillText(n, x + dx * 9, y + dy * 9);
   }
 }
 
@@ -1933,6 +2303,7 @@ function render(now) {
     tab.edgeObjs.forEach((e, i) => { e.visible = edgeVis[i]; });
   }
   renderer.render(tab.overlay, tab.camera);
+  drawOrigin(tab);
   lastRenderMs = performance.now() - t0;
   labelRenderer.render(tab.overlay, tab.camera);
   drawTriad(tab.camera);
@@ -1940,6 +2311,35 @@ function render(now) {
 }
 const emptyScene = new THREE.Scene();
 const defaultCam = new THREE.PerspectiveCamera();
+
+// world origin marker: short X/Y/Z arms + a dot, constant size on screen
+const originScene = new THREE.Scene();
+const originMarker = (() => {
+  const g = new THREE.Group();
+  const arm = (dir, color) => {
+    const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), dir]);
+    const l = new THREE.Line(geo, new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.9 }));
+    l.renderOrder = 998;
+    return l;
+  };
+  g.add(arm(new THREE.Vector3(1, 0, 0), 0xe5534b), arm(new THREE.Vector3(0, 1, 0), 0x57ab5a), arm(new THREE.Vector3(0, 0, 1), 0x539bf5));
+  const dot = new THREE.Points(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3()]),
+    new THREE.PointsMaterial({ color: 0xffffff, size: 6, sizeAttenuation: false, depthTest: false, transparent: true }));
+  dot.renderOrder = 999;
+  g.add(dot);
+  g.traverse((o) => { o.raycast = () => {}; o.frustumCulled = false; });
+  originScene.add(g);
+  return g;
+})();
+const ORIGIN_PX = 36;
+let showOrigin = true;
+$('btnOrigin').onclick = () => { showOrigin = !showOrigin; $('btnOrigin').classList.toggle('active', showOrigin); requestRender(); };
+function drawOrigin(tab) {
+  if (!showOrigin) return;
+  originMarker.scale.setScalar(worldPerPixel(tab, originMarker.position) * ORIGIN_PX);
+  originMarker.updateMatrixWorld(true);
+  renderer.render(originScene, tab.camera);
+}
 
 function loop(now) {
   requestAnimationFrame(loop);
@@ -1991,7 +2391,8 @@ window.__sv = {
     requestRender();
     return tab;
   },
-  snapHit, applySection,
+  snapHit, applySection, sectionHandleAt, fitCylinderFace, workerAssetsReady,
+  get persistentGeometries() { let n = 0; originScene.traverse((o) => { if (o.geometry) n++; }); return n; },
   get tabs() { return tabs; }, get active() { return active; }, THREE, renderer, controls, setView, setMode, selectParts, pick, pool,
   loadUrl: (url, name) => loadBuffer(name || url.split('/').pop(), async () => (await fetch(url)).arrayBuffer(), 0),
   stats: () => ({ fps, lastRenderMs, calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, tabs: tabs.length,

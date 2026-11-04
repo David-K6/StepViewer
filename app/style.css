@@ -126,3 +126,16 @@ input[type=range] { accent-color: var(--acc); }
 .ctxmenu .k { margin-left: auto; color: var(--muted); font-size: 11px; }
 .ctxmenu button:hover:not(:disabled) .k { color: #dbe6ff; }
 .ctxmenu .sep { height: 1px; margin: 4px 2px; background: var(--line); }
+
+/* update dialog */
+.modal-body.upd { width: 440px; }
+.modal-body.upd td:first-child { color: var(--fg); font-family: inherit; }
+.modal-body.upd td:last-child { font-family: Consolas, monospace; color: #fff; }
+.upd-msg { min-height: 2.6em; margin: 10px 0 6px; line-height: 1.4; }
+.upd-msg.err { color: #ff8a80; }
+.upd-progress { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin-bottom: 6px; }
+.upd-progress > div { height: 100%; width: 0; background: var(--acc); transition: width .2s; }
+.upd-actions { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.upd-actions .spacer { flex: 1; }
+.upd-actions a { color: var(--acc); }
+.modal-body .upd-actions .btn { margin-top: 0; float: none; }

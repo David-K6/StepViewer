@@ -1,11 +1,14 @@
 /* StepViewer parse worker: runs OpenCascade (occt-import-js WASM) off the UI thread,
  * converts the result to typed arrays and extracts CAD edges (B-rep face boundaries). */
 /* global occtimportjs */
-importScripts('vendor/occt-import-js.js', 'swfile.js');
+// When started from a blob (see main.js), the page hands over blob URLs of the scripts and the WASM it
+// prefetched, so new workers never depend on the local server still being reachable.
+const ASSETS = self.__svAssets || { occt: 'vendor/occt-import-js.js', sw: 'swfile.js', wasm: null };
+importScripts(ASSETS.occt, ASSETS.sw);
 
 let occtPromise = null;
 function getOcct() {
-  if (!occtPromise) occtPromise = occtimportjs({ locateFile: (p) => 'vendor/' + p });
+  if (!occtPromise) occtPromise = occtimportjs({ locateFile: (p) => (ASSETS.wasm && /\.wasm$/.test(p) ? ASSETS.wasm : 'vendor/' + p) });
   return occtPromise;
 }
 

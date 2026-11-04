@@ -13,6 +13,7 @@ const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 
 const APP_ID = 'stepviewer-1';
+const REPO = 'David-K6/StepViewer'; // GitHub releases: tag = version, asset StepViewer.exe
 const PREFERRED_PORT = 47831;
 const LOG_FILE = path.join(os.tmpdir(), 'StepViewer.log');
 
@@ -64,7 +65,7 @@ let buildId = null;
 function getBuildId() {
   if (buildId) return buildId;
   if (!sea) return (buildId = 'dev');
-  const h = crypto.createHash('sha1');
+  const h = crypto.createHash('sha1').update(getVersion());
   for (const f of ['index.html', 'main.js', 'worker.js', 'swfile.js', 'style.css', 'vendor/three.module.js', 'vendor/three.core.js',
     'vendor/three-mesh-bvh.module.js', 'vendor/occt-import-js.js', 'vendor/addons/OrbitControls.js', 'vendor/addons/CSS2DRenderer.js']) {
     const b = getAsset(f);
@@ -80,6 +81,144 @@ function assetEtag(rel, buf) {
   const tag = '"' + crypto.createHash('sha1').update(buf).digest('base64url') + '"';
   if (sea) etags.set(rel, tag);
   return tag;
+}
+
+// ---- version + self update ----
+let version = null;
+function getVersion() {
+  if (version) return version;
+  try {
+    const pkg = sea ? JSON.parse(Buffer.from(sea.getAsset('package.json')).toString('utf8')) : require('./package.json');
+    version = String(pkg.version);
+  } catch { version = '0.0.0'; }
+  return version;
+}
+/** numeric compare of "1.2.3" / "v1.2.3" (missing parts = 0) */
+function compareVersions(a, b) {
+  const pa = String(a).trim().replace(/^v/i, '').split(/[.+-]/).map((x) => parseInt(x, 10) || 0);
+  const pb = String(b).trim().replace(/^v/i, '').split(/[.+-]/).map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
+const RELEASE_API = process.env.STEPVIEWER_UPDATE_API || `https://api.github.com/repos/${REPO}/releases/latest`;
+const RELEASES_PAGE = `https://github.com/${REPO}/releases`;
+async function latestRelease() {
+  const r = await fetch(RELEASE_API, { headers: { 'User-Agent': 'StepViewer', Accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(15000) });
+  if (!r.ok) throw new Error(`GitHub 응답 ${r.status}`);
+  const j = await r.json();
+  const asset = (j.assets || []).find((a) => String(a.name).toLowerCase() === 'stepviewer.exe');
+  return {
+    version: String(j.tag_name || '').replace(/^v/i, ''), url: j.html_url || RELEASES_PAGE, notes: j.body || '', published: j.published_at || null,
+    asset: asset ? { url: asset.browser_download_url, size: asset.size } : null,
+  };
+}
+/** the exe to replace: the running one when packaged (STEPVIEWER_UPDATE_EXE only for tests of the dev build) */
+const updateTarget = () => (sea ? process.execPath : process.env.STEPVIEWER_UPDATE_EXE || null);
+const upd = { phase: 'idle', received: 0, total: 0, error: null, version: null };
+
+const STALL_MS = 30000;
+let updAbort = null;
+/** run the downloaded exe with --sv-check-version: it exits 0 only if it starts and is that version */
+function checkExe(file, ver) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+    let child;
+    try { child = spawn(file, [`--sv-check-version=${ver}`], { stdio: 'ignore', windowsHide: true }); } catch { return finish(false); }
+    const t = setTimeout(() => { try { child.kill(); } catch { /* ignore */ } finish(false); }, 30000);
+    child.once('error', () => { clearTimeout(t); finish(false); });
+    child.once('exit', (code) => { clearTimeout(t); finish(code === 0); });
+  });
+}
+function rm(f) { try { fs.unlinkSync(f); } catch { /* ignore */ } }
+
+async function runUpdate() {
+  const exe = updateTarget();
+  upd.error = null;
+  const tmp = exe ? exe + '.download' : null, old = exe ? exe + '.old' : null;
+  let swapped = false;
+  try {
+    if (!exe) throw new Error('개발 모드에서는 자동 업데이트를 할 수 없습니다.');
+    upd.phase = 'checking';
+    const rel = await latestRelease();
+    if (compareVersions(rel.version, getVersion()) <= 0) throw new Error('이미 최신 버전입니다.');
+    if (!rel.asset) throw new Error('릴리즈에 StepViewer.exe 파일이 없습니다.');
+    Object.assign(upd, { phase: 'downloading', received: 0, total: rel.asset.size || 0, version: rel.version });
+    updAbort = new AbortController();
+    let stall = null;
+    const kick = () => { clearTimeout(stall); stall = setTimeout(() => updAbort.abort(new Error('다운로드가 30초 동안 멈췄습니다.')), STALL_MS); };
+    kick();
+    try {
+      const res = await fetch(rel.asset.url, { headers: { 'User-Agent': 'StepViewer', Accept: 'application/octet-stream' }, redirect: 'follow', signal: updAbort.signal });
+      if (!res.ok || !res.body) throw new Error(`다운로드 실패 (${res.status})`);
+      const fh = await fs.promises.open(tmp, 'w');
+      try {
+        for await (const chunk of res.body) {
+          kick();
+          await fh.write(chunk);
+          upd.received += chunk.length;
+        }
+      } finally { await fh.close(); }
+    } catch (e) {
+      const reason = updAbort.signal.aborted ? updAbort.signal.reason : e;
+      throw new Error(reason && reason.message === 'cancelled' ? '업데이트를 취소했습니다.' : `다운로드 실패: ${(reason && reason.message) || reason}`);
+    } finally { clearTimeout(stall); updAbort = null; }
+    // validate the complete file: size, PE header, and that it actually runs as the expected version
+    const size = fs.statSync(tmp).size;
+    const head = Buffer.alloc(2);
+    const fd = fs.openSync(tmp, 'r');
+    try { fs.readSync(fd, head, 0, 2, 0); } finally { fs.closeSync(fd); }
+    if ((rel.asset.size && size !== rel.asset.size) || head.toString('latin1') !== 'MZ') throw new Error('받은 파일이 올바르지 않습니다 (크기/형식 불일치).');
+    upd.phase = 'verifying';
+    if (!(await checkExe(tmp, rel.version))) throw new Error('받은 파일을 실행할 수 없거나 버전이 다릅니다.');
+    // a running exe can be renamed (not overwritten): move it aside, put the new one in its place
+    rm(old);
+    try { fs.renameSync(exe, old); } catch (e) {
+      throw new Error(`실행 파일을 바꿀 수 없습니다 (${e.code || e.message}). 쓰기 권한이 있는 폴더로 옮기거나 릴리즈 페이지에서 직접 받아 주세요.`);
+    }
+    try { fs.renameSync(tmp, exe); } catch (e) {
+      swapped = true; // the catch below puts the previous exe back (with retries) and reports whether that worked
+      throw new Error(`새 실행 파일을 놓지 못했습니다 (${e.code || e.message})`);
+    }
+    swapped = true;
+    upd.phase = 'restarting';
+    log('updated', getVersion(), '->', rel.version, exe);
+    // let the window read the 'restarting' state, then hand over to the new exe (it waits for this pid to exit)
+    await new Promise((r) => setTimeout(r, 700));
+    const keep = process.argv.slice(sea ? 1 : 2).filter((a) => a.startsWith('--port=')); // isolated test instances keep their port
+    await new Promise((resolve, reject) => {
+      let child;
+      try { child = spawn(exe, [...keep, `--after-update=${process.pid}`], { detached: true, stdio: 'ignore', env: process.env }); } catch (e) { return reject(e); }
+      child.once('error', reject);
+      child.once('spawn', () => { child.unref(); resolve(); });
+    });
+    process.exit(0);
+  } catch (e) {
+    if (swapped) { // the new exe did not start: put the old one back (a lock may be short-lived -> retry)
+      let restored = false, why = '';
+      for (let i = 0; i < 6 && !restored; i++) {
+        if (i) await new Promise((r) => setTimeout(r, 500));
+        try {
+          if (fs.existsSync(exe)) { rm(tmp); fs.renameSync(exe, tmp); }
+          fs.renameSync(old, exe);
+          restored = true;
+        } catch (re) { why = re.code || re.message; }
+      }
+      log(restored ? 'restored previous exe' : `restore failed ${why}`);
+      e = restored
+        ? new Error(`업데이트를 마치지 못해 이전 버전으로 되돌렸습니다 (${e.code || e.message}).`)
+        : new Error(`업데이트를 마치지 못했고 이전 버전으로 되돌리지도 못했습니다 (${why}). 이전 실행 파일은 "${old}"에 있습니다. `
+          + `StepViewer를 종료한 뒤 이 파일의 이름을 "${path.basename(exe)}"(으)로 바꾸거나 릴리즈 페이지에서 다시 받아 주세요.`);
+      if (!restored) { upd.phase = 'error'; upd.error = e.message; log('update failed', upd.error); return; } // keep the new file for inspection
+    }
+    if (tmp && fs.existsSync(tmp)) rm(tmp);
+    upd.phase = 'error';
+    upd.error = e.message || String(e);
+    log('update failed', upd.error);
+  }
 }
 
 // ---- files passed on the command line / forwarded from other instances ----
@@ -141,15 +280,23 @@ function broadcastOpen(ids) {
   return true;
 }
 
+// A window that is closed sends /api/bye (pagehide beacon) -> exit shortly after the last one is gone.
+// A connection that merely dropped (window asleep/frozen by the browser, system sleep) gets a long grace
+// period instead: the window keeps working and reconnects when it wakes up.
+// The decision is made for the connection that went away last (each window has its own id).
+const byeCids = new Map(); // window id -> time of its goodbye
+let lastGoneCid = null;
+const CLOSE_GRACE_MS = 8000, DROP_GRACE_MS = 30 * 60 * 1000;
 function scheduleExitCheck() {
   clearTimeout(exitTimer);
   if (clients.size > 0) return;
+  const closed = lastGoneCid !== null && byeCids.has(lastGoneCid);
   exitTimer = setTimeout(() => {
     if (clients.size === 0 && everConnected) {
-      log('no viewer windows left, exiting');
+      log(closed ? 'no viewer windows left, exiting' : 'viewer connection lost for a long time, exiting');
       process.exit(0);
     }
-  }, 8000);
+  }, closed ? CLOSE_GRACE_MS : DROP_GRACE_MS);
 }
 
 function json(res, code, obj) {
@@ -175,7 +322,34 @@ function createServer(initialIds) {
     const p = decodeURIComponent(url.pathname);
     try {
       if (p === '/favicon.ico') { res.writeHead(204); return res.end(); }
-      if (p === '/api/hello') return json(res, 200, { app: APP_ID, pid: process.pid });
+      if (p === '/api/hello') return json(res, 200, { app: APP_ID, pid: process.pid, version: getVersion() });
+
+      // update endpoints: the custom header makes cross-site requests need a CORS preflight (which we never grant)
+      if (p.startsWith('/api/update/')) {
+        if (req.headers['x-stepviewer'] !== '1') return json(res, 403, { error: 'forbidden' });
+        if (p === '/api/update/check' && req.method === 'GET') {
+          const current = getVersion();
+          try {
+            const rel = await latestRelease();
+            const newer = compareVersions(rel.version, current) > 0;
+            return json(res, 200, { current, latest: rel.version, newer, url: rel.url, notes: rel.notes, published: rel.published,
+              canUpdate: newer && !!rel.asset && !!updateTarget(),
+              reason: !newer ? null : !rel.asset ? '릴리즈에 StepViewer.exe 파일이 없습니다.' : !updateTarget() ? '개발 모드에서는 자동 업데이트를 할 수 없습니다.' : null });
+          } catch (e) {
+            return json(res, 200, { current, latest: null, newer: false, canUpdate: false, url: RELEASES_PAGE, error: `최신 버전을 확인하지 못했습니다: ${e.message || e}` });
+          }
+        }
+        if (p === '/api/update/start' && req.method === 'POST') {
+          if (!['downloading', 'checking', 'verifying', 'restarting'].includes(upd.phase)) runUpdate();
+          return json(res, 202, { ok: true });
+        }
+        if (p === '/api/update/cancel' && req.method === 'POST') {
+          if (upd.phase === 'downloading' && updAbort) updAbort.abort(new Error('cancelled'));
+          return json(res, 200, { ok: true, phase: upd.phase });
+        }
+        if (p === '/api/update/status' && req.method === 'GET') return json(res, 200, { ...upd, current: getVersion() });
+        return json(res, 404, { error: 'not found' });
+      }
 
       if (p === '/api/events') {
         res.writeHead(200, {
@@ -193,7 +367,17 @@ function createServer(initialIds) {
           res.write(`event: openfiles\ndata: ${JSON.stringify(ids.map(fileInfo))}\n\n`);
         }
         const ka = setInterval(() => res.write(': ka\n\n'), 20000);
-        req.on('close', () => { clearInterval(ka); clients.delete(res); scheduleExitCheck(); });
+        const cid = url.searchParams.get('cid') || '';
+        req.on('close', () => { clearInterval(ka); clients.delete(res); lastGoneCid = cid; scheduleExitCheck(); });
+        return;
+      }
+
+      if (p === '/api/bye' && req.method === 'POST') {
+        const now = Date.now();
+        for (const [k, t] of byeCids) if (now - t > 60000) byeCids.delete(k);
+        byeCids.set(url.searchParams.get('cid') || '', now);
+        res.writeHead(204); res.end();
+        scheduleExitCheck();
         return;
       }
 
@@ -390,7 +574,33 @@ async function forwardTo(port, files) {
   process.exit(0);
 }
 
+function cleanupAfterUpdate() {
+  const exe = updateTarget();
+  if (!exe) return;
+  let tries = 0;
+  const tick = () => {
+    let left = 0;
+    for (const f of [exe + '.old', exe + '.download']) {
+      if (!fs.existsSync(f)) continue;
+      try { fs.unlinkSync(f); } catch { left++; }
+    }
+    if (left && ++tries < 20) setTimeout(tick, 1000);
+  };
+  tick();
+}
+
 async function main() {
+  // run by the updater of the previous version to make sure this exe starts and is the expected version
+  const chk = process.argv.find((a) => a.startsWith('--sv-check-version='));
+  if (chk) process.exit(chk.slice(chk.indexOf('=') + 1) === getVersion() ? 0 : 3);
+  // started by an update: the previous process must be gone before we take its port / lock
+  const after = process.argv.find((a) => a.startsWith('--after-update='));
+  const afterUpdate = !!after;
+  if (after) {
+    const pid = Number(after.split('=')[1]);
+    for (let i = 0; i < 100 && pid && pidAlive(pid); i++) await new Promise((r) => setTimeout(r, 150));
+    log('started after update', getVersion());
+  }
   const self = new Set([process.execPath, __filename].map((p) => path.resolve(p).toLowerCase()));
   const args = process.argv.slice(1).filter((a) => !a.startsWith('--') && !self.has(path.resolve(a).toLowerCase()));
   const files = args.filter((a) => STEP_EXT.test(a));
@@ -426,9 +636,13 @@ async function main() {
     actualPort = await listen(server, 0);
   }
   if (!explicitPort) writeInstanceFile(actualPort);
+  cleanupAfterUpdate(); // only now: we are the instance, so no update of ours can be in progress
   serverUrl = `http://127.0.0.1:${actualPort}/`;
-  log('StepViewer listening on', serverUrl, sea ? '(packaged)' : '(dev)');
-  openBrowser(appUrl(serverUrl));
+  log('StepViewer listening on', serverUrl, sea ? '(packaged)' : '(dev)', getVersion());
+  if (afterUpdate) {
+    // the windows of the previous version reconnect by themselves (and reload); open one only if none does
+    setTimeout(() => { if (clients.size === 0) openBrowser(appUrl(serverUrl)); }, 8000);
+  } else openBrowser(appUrl(serverUrl));
 
   // If no window ever connects (browser failed to open), don't linger forever.
   setTimeout(() => {

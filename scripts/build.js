@@ -23,6 +23,7 @@ const walk = (dir) => {
   }
 };
 walk(path.join(root, 'app'));
+assets['package.json'] = path.join(root, 'package.json'); // version for the update check
 console.log(`embedding ${Object.keys(assets).length} assets`);
 
 // 3. SEA blob

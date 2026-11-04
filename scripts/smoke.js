@@ -22,14 +22,21 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     const dir = path.join(root, 'testfiles');
     files = fs.readdirSync(dir).filter((f) => /\.(stp|step)$/i.test(f) && fs.statSync(path.join(dir, f)).size < 2e6).map((f) => path.join(dir, f));
   }
+  // mock GitHub "latest release" (no network in tests): a newer version without an exe asset
+  const http = require('node:http');
+  const mockRel = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ tag_name: '99.0.0', html_url: 'https://example.invalid/releases/99.0.0', assets: [] }));
+  }).listen(PORT + 100, '127.0.0.1');
   const srv = spawn(process.execPath, [path.join(root, 'server.js'), `--port=${PORT}`], {
-    env: { ...process.env, STEPVIEWER_NO_BROWSER: '1', STEPVIEWER_KEEPALIVE: '1' }, stdio: 'pipe',
+    env: { ...process.env, STEPVIEWER_NO_BROWSER: '1', STEPVIEWER_KEEPALIVE: '1', STEPVIEWER_UPDATE_API: `http://127.0.0.1:${PORT + 100}/latest` }, stdio: 'pipe',
   });
   await wait(600);
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'sv-smoke-'));
   const browser = await puppeteer.launch({ executablePath: EDGE, headless: 'new', userDataDir: profile,
     args: ['--use-angle=d3d11', '--enable-webgl', '--ignore-gpu-blocklist', '--window-size=1600,1000'] });
   const errors = [];
+  let serverGone = false;
   const post = (paths) => fetch(`http://127.0.0.1:${PORT}/api/open`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths }) });
   try {
     const page = await browser.newPage();
@@ -41,6 +48,16 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     await page.waitForFunction(() => window.__sv);
     const ev = (fn, ...a) => page.evaluate(fn, ...a);
     const baseGeo = await ev(() => window.__sv.renderer.info.memory.geometries);
+
+    // ---- update dialog: current version vs. latest release
+    await page.click('#btnUpdate');
+    await page.waitForFunction(() => document.getElementById('updLatest').textContent !== '확인 중…', { timeout: 20000 });
+    const upd = await ev(() => ({ cur: document.getElementById('updCurrent').textContent, latest: document.getElementById('updLatest').textContent,
+      msg: document.getElementById('updMsg').textContent, disabled: document.getElementById('btnUpdApply').disabled }));
+    const pkgVer = require(path.join(root, 'package.json')).version;
+    check(upd.cur === pkgVer && upd.latest === '99.0.0' && upd.disabled && /새 버전 99\.0\.0/.test(upd.msg), 'update check shows current/latest version (no exe asset -> update disabled)', JSON.stringify(upd));
+    await page.keyboard.press('Escape');
+    check(await ev(() => document.getElementById('updateDlg').classList.contains('hidden')), 'Escape closes the update dialog');
 
     // ---- load all files as tabs
     const t0 = Date.now();
@@ -154,6 +171,10 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     check(ms.length === 1 && ms[0].type === 'distance' && /\d/.test(ms[0].text), 'distance measurement created', ms[0] && ms[0].text.replace(/<[^>]+>/g, ''));
     await shot('3-measure');
     await page.keyboard.press('Escape');
+    // Shift+C clears every measurement and the selection
+    await ev(() => window.__sv.selectParts([window.__sv.active.parts[0]]));
+    await page.keyboard.down('Shift'); await page.keyboard.press('C'); await page.keyboard.up('Shift');
+    check(await ev(() => window.__sv.active.measures.length === 0 && window.__sv.active.selection.size === 0), 'Shift+C clears all measurements and the selection');
 
     // section with real caps
     await page.keyboard.press('x');
@@ -170,6 +191,21 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
       return false;
     });
     check(capHit, 'picking through the cut lands on the section cap');
+    const grab = await ev(() => {
+      const sv = window.__sv; const r = document.getElementById('canvas').getBoundingClientRect();
+      for (let y = 0.15; y < 0.9; y += 0.02) for (let x = 0.15; x < 0.9; x += 0.02) {
+        const e = { clientX: r.left + r.width * x, clientY: r.top + r.height * y };
+        if (sv.sectionHandleAt(e, sv.pick(e))) return { x: e.clientX, y: e.clientY };
+      }
+      return null;
+    });
+    if (grab) {
+      const before = await ev(() => ({ pos: window.__sv.active.section.y.pos, cam: window.__sv.active.camera.position.toArray() }));
+      await page.mouse.move(grab.x, grab.y); await page.mouse.down(); await page.mouse.move(grab.x + 40, grab.y + 60, { steps: 8 }); await page.mouse.up(); await wait(150);
+      const after = await ev(() => ({ pos: window.__sv.active.section.y.pos, cam: window.__sv.active.camera.position.toArray(), planes: window.__sv.active.clipPlanes.length }));
+      check(Math.abs(after.pos - before.pos) > 1e-6 && after.planes === 1 && after.cam.every((v, i) => Math.abs(v - before.cam[i]) < 1e-4),
+        'left drag on the section plane moves the section (camera unchanged)', `${before.pos.toFixed(3)} -> ${after.pos.toFixed(3)} planes ${after.planes} cam ${JSON.stringify(before.cam.map((v, i) => after.cam[i] - v))}`);
+    } else check(false, 'left drag on the section plane moves the section', 'no grabbable plane point found');
     await ev(() => document.querySelector('.sec-row[data-axis=y] .sec-on').click());
     check(await ev(() => window.__sv.active.clipPlanes.length === 0 && window.__sv.active.caps.length === 0), 'section off removes planes and caps');
     await page.keyboard.press('x');
@@ -178,15 +214,17 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     await ev(() => { const sv = window.__sv; sv.selectParts([sv.active.parts[0]]); const s = document.getElementById('selOpacity'); s.value = 20; s.dispatchEvent(new Event('input')); });
     check(await ev(() => { const p = window.__sv.active.parts[0]; return p.material.transparent && Math.abs(p.material.opacity - 0.2) < 1e-6; }), 'per-part opacity 20%');
     // color picker open -> selected part shows its real color (no selection tint); closing restores the tint
-    const emis = () => ev(() => window.__sv.active.parts[0].material.emissive.getHex());
-    const selTint = await emis();
+    const tinted = () => ev(() => { const p = window.__sv.active.parts[0]; return !p.material.color.equals(p.baseColor); });
+    const tint0 = await tinted();
     // cancelable click: our handler runs, but the native popup (which would swallow later key presses) is not opened
     await ev(() => { const c = document.getElementById('selColor'); c.addEventListener('click', (e) => e.preventDefault(), { once: true }); c.dispatchEvent(new MouseEvent('click', { cancelable: true })); });
-    const tintOpen = await emis();
-    await ev(() => { const c = document.getElementById('selColor'); c.value = '#ff0000'; c.dispatchEvent(new Event('input')); });
-    const tintEdit = await emis();
+    const tintOpen = await tinted();
+    await ev(() => { const c = document.getElementById('selColor'); c.value = '#ffffff'; c.dispatchEvent(new Event('input')); });
+    const tintEdit = await tinted();
     await ev(() => document.getElementById('selColor').dispatchEvent(new Event('change')));
-    check(selTint !== 0 && tintOpen === 0 && tintEdit === 0 && (await emis()) === selTint, 'color picker suppresses selection highlight while open', JSON.stringify([selTint, tintOpen, tintEdit]));
+    check(tint0 && !tintOpen && !tintEdit && (await tinted()), 'color picker suppresses selection highlight while open', JSON.stringify([tint0, tintOpen, tintEdit]));
+    check(await ev(() => { const p = window.__sv.active.parts[0]; const c = p.material.color; return p.baseColor.r > 0.99 && p.baseColor.b > 0.99 && c.b - c.r > 0.2; }),
+      'a white part gets a visible selection highlight');
     await ev(() => { const g = document.getElementById('globalOpacity'); g.value = 50; g.dispatchEvent(new Event('input')); });
     check(await ev(() => window.__sv.active.parts.every((p) => p.material.transparent)), 'global opacity 50% applies to all');
     await shot('5-transparent');
@@ -197,6 +235,14 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     await page.keyboard.press('p');
     check(await ev(() => window.__sv.active.isOrtho), 'P toggles orthographic');
     await page.keyboard.press('p');
+    await wait(350);
+    // vertical drag of ~180°: the camera must go over the top (no polar clamp), ending upside down
+    await ev(() => window.__sv.selectParts([]));
+    await page.mouse.move(cx, cy - box.h * 0.28); await page.mouse.down(); await page.mouse.move(cx, cy + box.h * 0.28, { steps: 30 }); await page.mouse.up(); await wait(900);
+    const upZ = await ev(() => window.__sv.active.camera.up.z);
+    check(upZ < -0.3, 'left drag rotates freely past the pole (no 180° limit)', `camera up.z ${upZ.toFixed(3)}`);
+    await ev(() => window.__sv.setView(window.__sv.active, 'iso', false));
+    check(await ev(() => window.__sv.active.camera.up.z > 0.999), 'standard views restore Z up');
 
     // ---- section accuracy on a synthetic model: outer box [-500,500]^3 containing inner box x∈[-300,-200]
     const synth = await ev(async () => {
@@ -280,6 +326,33 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
         if (!(mid && mid.cap)) out.midMiss = (out.midMiss || 0) + 1;
       }
       out.tangentOutside = outside; out.tangentCapHits = capHits;
+      // radius on a half cylinder face (axis (1,2,3), r 5, length 20) and on a plane
+      const ax = new T.Vector3(1, 2, 3).normalize(), uu = new T.Vector3().crossVectors(ax, new T.Vector3(1, 0, 0)).normalize(), ww = new T.Vector3().crossVectors(ax, uu);
+      const C0 = new T.Vector3(10, -20, 30), P = [], N = [], I = [];
+      const seg = 24;
+      for (let i = 0; i <= seg; i++) {
+        const a = (Math.PI * i) / seg, n = uu.clone().multiplyScalar(Math.cos(a)).addScaledVector(ww, Math.sin(a));
+        for (const h of [0, 20]) { const p = C0.clone().addScaledVector(ax, h).addScaledVector(n, 5); P.push(p.x, p.y, p.z); N.push(n.x, n.y, n.z); }
+      }
+      for (let i = 0; i < seg; i++) { const k = i * 2; I.push(k, k + 2, k + 1, k + 1, k + 2, k + 3); }
+      const cyl = { name: 'halfcyl', color: [0.7, 0.7, 0.7], position: new Float32Array(P), normal: new Float32Array(N), index: new Uint16Array(I), colors: null,
+        edges: new Float32Array(0), faceFirst: new Int32Array([0]), faceLast: new Int32Array([I.length / 3 - 1]) };
+      const tc = sv.loadResult('cyl', { tree: { name: 'cyl', meshes: [0], children: [] }, meshes: [cyl] });
+      const pt = new T.Vector3().fromArray(P, 12);
+      const fit = sv.fitCylinderFace(tc, { part: tc.parts[0], tri: 3, point: pt });
+      out.cyl = fit && { r: fit.radius, axisDot: Math.abs(fit.normal.dot(ax)), len: fit.length, centerOff: fit.center.clone().sub(C0).cross(ax).length() };
+      const tp = sv.loadResult('plane', { tree: { name: 'plane', meshes: [0], children: [] }, meshes: [box(0, 0, 0, 10, 10, 10, [0.7, 0.7, 0.7])] });
+      out.planeFit = sv.fitCylinderFace(tp, { part: tp.parts[0], tri: 0, point: new T.Vector3(10, 5, 5) });
+      // a very flat cone (r 5 -> 5.01 over 1 mm) must not pass as a cylinder
+      const CP = [], CN = [];
+      for (let i = 0; i <= seg; i++) {
+        const a = (2 * Math.PI * i) / seg, n = uu.clone().multiplyScalar(Math.cos(a)).addScaledVector(ww, Math.sin(a));
+        const slope = 0.01, nn = n.clone().addScaledVector(ax, -slope).normalize();
+        for (const [h, rr] of [[0, 5], [1, 5.01]]) { const p = C0.clone().addScaledVector(ax, h).addScaledVector(n, rr); CP.push(p.x, p.y, p.z); CN.push(nn.x, nn.y, nn.z); }
+      }
+      const cone = { ...cyl, name: 'cone', position: new Float32Array(CP), normal: new Float32Array(CN) };
+      const tk = sv.loadResult('cone', { tree: { name: 'cone', meshes: [0], children: [] }, meshes: [cone] });
+      out.coneFit = sv.fitCylinderFace(tk, { part: tk.parts[0], tri: 3, point: new T.Vector3().fromArray(CP, 12) });
       return out;
     });
     check(synth.center && synth.center.cap && Math.abs(synth.center.x) < 1e-3 && synth.center.part === 'outer', 'cap in front of a nested part is picked (outer cap at x=0)', JSON.stringify(synth.center));
@@ -289,7 +362,23 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     check(!synth.midMiss, 'ray through the middle of a cut hits the cap (5 configurations)', String(synth.midMiss || 0));
     check(synth.tangentOutside === 0, 'grazing ray at an edge never yields a cap point outside the part', `${synth.tangentOutside} outside / ${synth.tangentCapHits} cap hits`);
     check(synth.capColor === '00ff00', 'section color change updates existing caps', synth.capColor);
+    check(synth.cyl && Math.abs(synth.cyl.r - 5) < 1e-3 && synth.cyl.axisDot > 0.99999 && Math.abs(synth.cyl.len - 20) < 1e-3 && synth.cyl.centerOff < 1e-3,
+      'radius on a half-cylinder face: R, axis, length, center', JSON.stringify(synth.cyl));
+    check(synth.planeFit === null, 'a planar face is not taken for a cylinder');
+    check(synth.coneFit === null, 'a very flat cone (0.57°) is not taken for a cylinder');
     await shot('6-synthetic');
+
+    // ---- a new worker must start even when the local server is gone (it is prefetched as blobs)
+    await ev(async () => { await window.__sv.workerAssetsReady; for (const w of window.__sv.pool.all.slice()) window.__sv.pool.kill(w); });
+    srv.kill(); serverGone = true;
+    await wait(500);
+    await ev(() => { document.getElementById('quality').value = 'fine'; }); // other cache key -> real parse
+    const nTabs = await ev(() => window.__sv.tabs.length);
+    await (await page.$('#fileInput')).uploadFile(files.find((f) => /\.(stp|step)$/i.test(f)) || files[0]);
+    await page.waitForFunction((n) => window.__sv.tabs.length > n && !window.__sv.tabs.some((t) => t.loading), { timeout: 600000 }, nTabs).catch(() => {});
+    const offline = await ev(() => { const t = window.__sv.tabs[window.__sv.tabs.length - 1]; return { parts: t.parts.length, info: t.loadInfo || '' }; });
+    check(offline.parts > 0 && !offline.info.includes('캐시'), 'a file opens after the server is gone (worker from prefetched blobs)', offline.info);
+    await ev(() => { document.getElementById('quality').value = 'normal'; });
 
     // ---- leak check: close all tabs (with a section on + a pending measurement) and compare GPU geometry count
     await page.keyboard.press('x');
@@ -301,11 +390,15 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     while (await ev(() => window.__sv.tabs.length)) { await page.keyboard.down('Control'); await page.keyboard.press('w'); await page.keyboard.up('Control'); await wait(80); }
     await wait(300);
     const geo = await ev(() => window.__sv.renderer.info.memory.geometries);
-    check(geo <= baseGeo, 'no GPU geometry left after closing all tabs', `${geo} (baseline ${baseGeo})`);
-    check(errors.length === 0, 'no console errors', errors.join(' | '));
+    const keep = await ev(() => window.__sv.persistentGeometries);
+    check(geo <= baseGeo + keep, 'no GPU geometry left after closing all tabs', `${geo} (baseline ${baseGeo} + ${keep} origin marker)`);
+    // once the server is gone, the event stream's reconnect attempts fail by design
+    const real = errors.filter((x) => !(serverGone && /ERR_CONNECTION_(REFUSED|RESET)/.test(x)));
+    check(real.length === 0, 'no console errors', real.join(' | '));
   } finally {
     await browser.close();
     srv.kill();
+    mockRel.close();
     try { fs.rmSync(profile, { recursive: true, force: true }); } catch { /* ignore */ }
   }
   console.log(fails.length ? `\n${fails.length} FAILED` : '\nALL PASSED');

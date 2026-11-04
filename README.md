@@ -9,18 +9,19 @@ A lightweight STEP / IGES / BREP / **SolidWorks (SLDPRT, SLDASM)** viewer. It ru
 - If StepViewer is already running, launching it again opens the new files as tabs in the existing window instead of starting a second copy.
 - To open `.step`, `.sldprt` or `.sldasm` files by double-clicking them, set StepViewer.exe as the default app for that file type in Windows' "Open with" dialog.
 - StepViewer quits automatically once the last viewer window is closed. The log is written to `%TEMP%\StepViewer.log`.
+- **Updates:** "업데이트 확인" (top right) compares the running version with the latest GitHub release. If a newer one exists, "업데이트" downloads it, replaces `StepViewer.exe` in place and restarts (open files are closed; the window reloads itself). The exe's folder must be writable; otherwise download it from the releases page. Versions before 0.0.4 have no updater, so install 0.0.4 once by hand.
 
 ## Features
 
 | Feature | How to use it |
 |---|---|
 | Multiple files as tabs | Drag and drop files, use "+ 열기" (Open) or Ctrl+O. Switch tabs with Ctrl+Tab and close one with Ctrl+W. |
-| Rotate / pan / zoom | Left drag rotates. Right or middle drag (or Shift+left drag) pans. The wheel zooms toward the cursor. Double-click sets the rotation center. |
+| Rotate / pan / zoom | Left drag rotates freely (no limit at the poles, the model can be turned over). Right or middle drag (or Shift+left drag) pans. The wheel zooms toward the cursor. Double-click sets the rotation center. The world origin is marked with small X/Y/Z arms (toggle with O). |
 | Views | Fit (F), isometric (0), front (1), right (3), top (7). Hold Ctrl for the opposite side. P toggles perspective/orthographic. |
 | Show / hide parts | Click the eye icon in the tree, H (hide the selection), I (isolate the selection), Shift+H (show everything). Right-click a part or a tree row for a menu: hide the selection, hide everything else (the camera stays put), show all. |
 | Transparency | Per part: select it and use the transparency slider. Whole model: the "전체 투명도" (overall transparency) slider. |
-| Section view | X opens the panel. Each of the X, Y and Z planes can be turned on and moved separately, and you can also define a plane by picking a face. Cut faces are filled solid (stencil caps) and part boundaries on them are drawn as lines. |
-| Measurement | Distance (D), angle (A), radius/diameter (R: click a round edge, or pick 3 points), face area and normal (G). Snaps to vertices and edges; hold Shift to turn snapping off. |
+| Section view | X opens the panel. Each of the X, Y and Z planes can be turned on and moved separately (slider, number, or left-drag the blue plane in the view while the panel is open), and you can also define a plane by picking a face. Cut faces are filled solid (stencil caps) and part boundaries on them are drawn as lines. |
+| Measurement | Distance (D), angle (A), radius/diameter (R: click a round edge or a cylindrical / partial cylindrical face, or pick 3 points), face area and normal (G). Snaps to vertices and edges; hold Shift to turn snapping off. Shift+C clears all measurements and the selection. |
 
 ## SolidWorks files (SLDPRT / SLDASM)
 
@@ -54,3 +55,5 @@ npm run build        # dist/StepViewer.exe (Node SEA, GUI subsystem)
 npm run smoke -- testfiles/x.stp   # headless Edge test with assertions
 npm run swtest -- a.SLDASM --pair p.SLDPRT=p.step   # SolidWorks reader regression test
 ```
+
+Releasing: set `version` in package.json, build, then create a GitHub release whose tag is exactly that version (e.g. `0.0.4`) with the exe attached as `StepViewer.exe`. The in-app updater relies on both.
