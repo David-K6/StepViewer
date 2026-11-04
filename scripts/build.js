@@ -38,7 +38,9 @@ fs.writeFileSync(cfgPath, JSON.stringify({
 execFileSync(process.execPath, ['--experimental-sea-config', cfgPath], { stdio: 'inherit' });
 
 // 4. copy node.exe and inject
-const exe = path.join(dist, 'StepViewer.exe');
+// `npm run build -- --out dist/x.exe` writes elsewhere (e.g. while StepViewer.exe is running)
+const outIdx = process.argv.indexOf('--out');
+const exe = outIdx > 0 ? path.resolve(process.argv[outIdx + 1]) : path.join(dist, 'StepViewer.exe');
 try { fs.rmSync(exe, { force: true }); } catch (e) { throw new Error(`${exe} is in use – close StepViewer first`); }
 fs.copyFileSync(process.execPath, exe);
 const postject = path.join(root, 'node_modules', 'postject', 'dist', 'cli.js');

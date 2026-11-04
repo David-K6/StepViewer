@@ -317,7 +317,58 @@
     return -1;
   }
 
+  // ------------------------------------------------------------------ appearances (colors)
+  // An appearance record in a DisplayLists stream:
+  //   CString name ("defaultplastic", "mattealuminum", ...) , u8 kind, u8 R, u8 G, u8 B, ... (81 bytes after the name)
+  //   CString path ("...\color.p2m")
+  // A part stores its part-level appearance first. An assembly's DisplayLists has one section per referenced
+  // file (it starts with the file's full path) whose first record is that file's appearance.
+  const P2M = new Uint8Array([0x2e, 0, 0x70, 0, 0x32, 0, 0x6d, 0]); // ".p2m" UTF-16LE
+  const NAME_GAP = 81;
+  function readAppearances(u8) {
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const out = [];
+    const findCstrEndingAt = (end, maxBack) => {
+      for (let s = end - 4; s >= Math.max(0, end - maxBack); s--) {
+        if (u8[s] !== 0xff || u8[s + 1] !== 0xfe || u8[s + 2] !== 0xff) continue;
+        const c = cstr(u8, dv, s);
+        if (c && c.end === end) return s;
+      }
+      return -1;
+    };
+    for (let i = indexOf(u8, P2M); i >= 0; i = indexOf(u8, P2M, i + 8)) {
+      const ps = findCstrEndingAt(i + 8, 1100);
+      if (ps < 0) continue;
+      const ne = ps - NAME_GAP;
+      if (ne < 4 || findCstrEndingAt(ne, 600) < 0) continue;
+      out.push({ off: ne, rgb: [u8[ne + 1] / 255, u8[ne + 2] / 255, u8[ne + 3] / 255] });
+    }
+    return out;
+  }
+  /** assembly DisplayLists -> Map(lower-case file name -> rgb) */
+  function readFileAppearances(u8) {
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const apps = readAppearances(u8);
+    const map = new Map();
+    if (!apps.length) return map;
+    const secs = []; // [offset, file name]
+    for (let i = u8.indexOf(0xff); i >= 0 && i + 4 < u8.length; i = u8.indexOf(0xff, i + 1)) {
+      if (u8[i + 1] !== 0xfe || u8[i + 2] !== 0xff || u8[i + 3] < 8 || u8[i + 3] === 0xff) continue;
+      const c = cstr(u8, dv, i);
+      if (!c || !/[\\/][^\\/]+\.sld(prt|asm)$/i.test(c.s)) continue;
+      secs.push([i, base(c.s).toLowerCase()]);
+      i = c.end - 1;
+    }
+    let k = -1;
+    for (const a of apps) {
+      while (k + 1 < secs.length && secs[k + 1][0] < a.off) k++;
+      if (k >= 0 && !map.has(secs[k][1])) map.set(secs[k][1], a.rgb);
+    }
+    return map;
+  }
+
   // ------------------------------------------------------------------ public API
+  const SW_DEFAULT = [202 / 255, 209 / 255, 238 / 255]; // SolidWorks' default part appearance
   const PALETTE = [
     [0.70, 0.74, 0.80], [0.82, 0.66, 0.46], [0.53, 0.70, 0.62], [0.74, 0.60, 0.74], [0.85, 0.78, 0.50],
     [0.52, 0.64, 0.82], [0.80, 0.56, 0.56], [0.60, 0.76, 0.48], [0.62, 0.62, 0.66], [0.47, 0.72, 0.78],
@@ -334,6 +385,8 @@
     if (!faces.length) throw new Error(`${label}: 표시 데이터에서 ${faces.invalid ? '손상되지 않은 ' : ''}면을 찾지 못했습니다.`);
     const m = facesToMesh(faces);
     m.invalidFaces = faces.invalid || 0;
+    const ap = readAppearances(dl);
+    if (ap.length) m.color = ap[0].rgb;
     return m;
   }
 
@@ -390,6 +443,10 @@
         }
       }
     }
+
+    // per-file appearance colors stored in the assembly's own display data
+    const asmDl = await c.get('Contents/DisplayLists');
+    const fileColor = asmDl ? readFileAppearances(asmDl) : new Map();
 
     const localCache = new Map(); // key -> local mesh
     const colorOf = new Map();
@@ -456,13 +513,19 @@
     };
 
     const addMeshes = (lms, Tr, label, fid, h, node) => {
-      if (!colorOf.has(fid)) colorOf.set(fid, PALETTE[colorOf.size % PALETTE.length]);
+      if (!colorOf.has(fid)) {
+        // SolidWorks appearance of the file; files without a record use SolidWorks' default appearance.
+        // Without any appearance data (older files) fall back to a palette color per file.
+        const f = files.get(fid);
+        const fc = f && f.swPath ? fileColor.get(base(f.swPath).toLowerCase()) : null;
+        colorOf.set(fid, fc || (fileColor.size ? null : PALETTE[colorOf.size % PALETTE.length]));
+      }
       const target = lms.length === 1 ? node : { name: label, meshes: [], children: [] };
       if (target !== node) node.children.push(target);
       lms.forEach((lm, bi) => {
         const nm = lms.length === 1 ? label : (lm.name || `Body ${bi + 1}`);
         const wm = transformMesh(lm, Tr);
-        meshes.push({ name: nm, color: lm.color || colorOf.get(fid), hidden: h, ...wm });
+        meshes.push({ name: nm, color: colorOf.get(fid) || lm.color || SW_DEFAULT, hidden: h, ...wm });
         target.children.push({ name: nm, meshes: [meshes.length - 1], children: [] });
       });
     };
@@ -506,7 +569,7 @@
     return { meshes, tree, missing, usedSiblings, invalidFaces };
   }
 
-  const API = { read, Container, scanFaces, facesToMesh, parseCompTree, parseDirectory, inflateRaw };
+  const API = { read, Container, scanFaces, facesToMesh, parseCompTree, parseDirectory, inflateRaw, readAppearances, readFileAppearances };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else G.SWFile = API;
 })(typeof self !== 'undefined' ? self : globalThis);

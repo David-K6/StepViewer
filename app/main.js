@@ -344,7 +344,9 @@ async function loadBuffer(name, getBuffer, size, resolveFile = null) {
     const hash = await contentHash(buffer);
     const popt = window.__svParseOpts && Object.keys(window.__svParseOpts).length ? '|' + JSON.stringify(window.__svParseOpts) : '';
     // v3: entries written by older versions (no corrupted-face filtering, cached partial assemblies) are ignored
-    const cacheKey = hash ? `v3|${quality}${popt}|${buffer.byteLength}|${hash}` : null;
+    // sw2: SolidWorks results now carry the files' appearance colors
+    const fmtVer = /\.sld(prt|asm)$/i.test(name) ? 'sw2|' : '';
+    const cacheKey = hash ? `v3|${fmtVer}${quality}${popt}|${buffer.byteLength}|${hash}` : null;
     let result = cacheKey ? await cacheGet(cacheKey) : null;
     // results depending on other files must never come from the cache (older versions could store them)
     if (result && ((result.missing && result.missing.length) || (result.usedSiblings && result.usedSiblings.length) || !cachedGeometryOk(result))) result = null;
@@ -496,6 +498,7 @@ function ensureBvh(p) {
 }
 
 // ---------------------------------------------------------------- materials / visibility
+let colorEditing = false;
 function effOpacity(tab, p) { return p.opacity * tab.globalOpacity; }
 function applyPart(tab, p) {
   const o = effOpacity(tab, p);
@@ -504,7 +507,8 @@ function applyPart(tab, p) {
   m.transparent = o < 0.999;
   m.depthWrite = !m.transparent;
   p.mesh.visible = p.visible && o > 0.004;
-  const e = tab.selection.has(p) ? SEL_EMISSIVE : tab.hover === p ? HOVER_EMISSIVE : BLACK;
+  // while the color picker is open, show selected parts in their true color (no highlight tint)
+  const e = tab.selection.has(p) ? (colorEditing ? BLACK : SEL_EMISSIVE) : tab.hover === p ? HOVER_EMISSIVE : BLACK;
   m.emissive.copy(e);
 }
 function refreshParts(tab, list = tab.parts) {
@@ -1602,6 +1606,17 @@ $('selColor').oninput = (e) => {
   renderTree();
   requestRender();
 };
+function setColorEditing(on) {
+  if (colorEditing === on) return;
+  colorEditing = on;
+  if (!active) return;
+  for (const p of active.selection) applyPart(active, p);
+  requestRender();
+}
+// click opens the native picker; change fires when it closes; blur covers cancel + clicking elsewhere
+$('selColor').addEventListener('click', () => setColorEditing(true));
+$('selColor').addEventListener('change', () => setColorEditing(false));
+$('selColor').addEventListener('blur', () => setColorEditing(false));
 $('btnHideSel').onclick = hideSelected;
 $('btnIsolate').onclick = isolateSelected;
 $('btnFitSel').onclick = fitSelection;
@@ -1749,7 +1764,7 @@ function onClick(e) {
 
 // ---------------------------------------------------------------- keyboard
 window.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT' && e.target.type !== 'range' && e.target.type !== 'checkbox' || e.target.tagName === 'SELECT') return;
+  if (e.target.tagName === 'INPUT' && e.target.type !== 'range' && e.target.type !== 'checkbox' && e.target.type !== 'color' || e.target.tagName === 'SELECT') return;
   const k = e.key.toLowerCase();
   if (e.ctrlKey && k === 'o') { e.preventDefault(); $('fileInput').click(); return; }
   if (e.ctrlKey && k === 'w') { e.preventDefault(); if (active) closeTab(active); return; }

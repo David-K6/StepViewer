@@ -177,6 +177,16 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     // transparency: per part and global
     await ev(() => { const sv = window.__sv; sv.selectParts([sv.active.parts[0]]); const s = document.getElementById('selOpacity'); s.value = 20; s.dispatchEvent(new Event('input')); });
     check(await ev(() => { const p = window.__sv.active.parts[0]; return p.material.transparent && Math.abs(p.material.opacity - 0.2) < 1e-6; }), 'per-part opacity 20%');
+    // color picker open -> selected part shows its real color (no selection tint); closing restores the tint
+    const emis = () => ev(() => window.__sv.active.parts[0].material.emissive.getHex());
+    const selTint = await emis();
+    // cancelable click: our handler runs, but the native popup (which would swallow later key presses) is not opened
+    await ev(() => { const c = document.getElementById('selColor'); c.addEventListener('click', (e) => e.preventDefault(), { once: true }); c.dispatchEvent(new MouseEvent('click', { cancelable: true })); });
+    const tintOpen = await emis();
+    await ev(() => { const c = document.getElementById('selColor'); c.value = '#ff0000'; c.dispatchEvent(new Event('input')); });
+    const tintEdit = await emis();
+    await ev(() => document.getElementById('selColor').dispatchEvent(new Event('change')));
+    check(selTint !== 0 && tintOpen === 0 && tintEdit === 0 && (await emis()) === selTint, 'color picker suppresses selection highlight while open', JSON.stringify([selTint, tintOpen, tintEdit]));
     await ev(() => { const g = document.getElementById('globalOpacity'); g.value = 50; g.dispatchEvent(new Event('input')); });
     check(await ev(() => window.__sv.active.parts.every((p) => p.material.transparent)), 'global opacity 50% applies to all');
     await shot('5-transparent');

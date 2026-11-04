@@ -10,6 +10,8 @@ const SW = require('../app/swfile.js');
 const occtimportjs = require('occt-import-js');
 
 const fails = [];
+const validColor = (c) => Array.isArray(c) && c.length === 3 && c.every((x) => x >= 0 && x <= 1);
+const hexColor = (c) => (validColor(c) ? '#' + c.map((x) => Math.round(x * 255).toString(16).padStart(2, '0')).join('') : String(c));
 const check = (cond, msg, extra = '') => { console.log(`${cond ? 'PASS' : 'FAIL'}  ${msg}${extra ? '  ' + extra : ''}`); if (!cond) fails.push(msg); };
 
 let occtP = null;
@@ -80,6 +82,7 @@ async function testAssembly(file) {
   const r = await SW.read(u8, name, resolve, { readStep });
   const ms = performance.now() - t0;
   check(r.meshes.length > 0 && r.missing.length === 0, `${name}: all components from the embedded cache`, `${r.meshes.length} parts, ${(ms / 1000).toFixed(2)} s, missing ${JSON.stringify(r.missing)}`);
+  check(r.meshes.every((m) => validColor(m.color)), `${name}: every component has a color`, [...new Set(r.meshes.map((m) => hexColor(m.color)))].join(' '));
   // SolidWorks' stored bbox of the root model (meters)
   const c = new SW.Container(u8);
   const { root } = SW.parseCompTree(new TextDecoder().decode(await c.get('swXmlContents/COMPINSTANCETREE')));
@@ -117,6 +120,7 @@ async function testPart(file, stepFile) {
   const r = await SW.read(new Uint8Array(fs.readFileSync(file)), name);
   const m = r.meshes[0];
   check(m.faceFirst.length > 0 && m.index.length > 0, `${name}: decoded`, `${m.faceFirst.length} faces, ${m.index.length / 3} tris`);
+  check(validColor(m.color), `${name}: SolidWorks appearance color read`, hexColor(m.color));
   if (!stepFile) return;
   const ref = await readStep(fs.readFileSync(stepFile));
   const fa = faces(r.meshes), fb = faces(ref);

@@ -28,12 +28,12 @@ No SolidWorks installation is needed. StepViewer reads the display tessellation 
 
 - **Parts (.SLDPRT):** faces come from the part's display data (`DisplayLists`). Face count and size match a STEP export of the same part (surface area within 0.01%), and measurement, sections and CAD edges work as usual.
 - **Assemblies (.SLDASM):** the component tree (positions, rotations, hidden and suppressed states) and the per-component display data are both stored in the assembly, so **the assembly file alone** is enough.
-  - Hidden components open hidden and suppressed ones are left out. Instances of the same part file share a color.
+  - Hidden components open hidden and suppressed ones are left out.
   - A component with no display data in the assembly is read from a **part file in the same folder** (Pack and Go's `_date` suffix is recognized) or, for components inserted with 3D Interconnect, from the **original STEP file**. When dragging and dropping, drop the assembly together with its part files.
 - Limitations
   - Files saved before SolidWorks 2015 (OLE format) are not supported.
   - Tessellation quality is whatever SolidWorks saved (the quality setting has no effect). Vertices lie on the true surface, so vertex and edge snapping is exact; points in the middle of curved faces can be off by a few tens of µm.
-  - SolidWorks appearances (colors, textures) are not read; each part file gets its own color. Cosmetic threads are not shown.
+  - Colors: each part shows its SolidWorks appearance color (part-level, or as stored per file in the assembly). Face- and feature-level appearances, textures and transparency are not read, and cosmetic threads are not shown.
   - A part saved without display data (Parasolid geometry only) can't be opened on its own. Inside an assembly it still shows, from the assembly's data.
 
 ## Performance
