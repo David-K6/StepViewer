@@ -29,6 +29,10 @@ renderer.setPixelRatio(basePixelRatio);
 const labelRenderer = new CSS2DRenderer({ element: $('labels') });
 
 const U = { sectionColor: new THREE.Color(0xe8743b) };
+// The same app runs in three ways: served by StepViewer.exe / `npm start` (local server: opened files, updater,
+// window lifetime), as the static web version (GitHub Pages, marked by scripts/web.js) or from file://.
+const WEB_BUILD = !!document.querySelector('meta[name="stepviewer-mode"][content="web"]');
+const LOCAL_SERVER = location.protocol !== 'file:' && !WEB_BUILD;
 
 function makePartMaterial(rgb, vertexColors) {
   return new THREE.MeshPhongMaterial({
@@ -2181,11 +2185,15 @@ $('btnUpdClose').onclick = () => {
   if (updBusy) { updFetch('/api/update/cancel', { method: 'POST' }).catch(() => {}); return; } // '취소' while downloading
   $('updateDlg').classList.add('hidden');
 };
-if (location.protocol === 'file:') $('btnUpdate').classList.add('hidden');
+if (WEB_BUILD) { // web version: no updater (always current); offer the desktop app instead
+  $('btnUpdate').textContent = '데스크톱 앱 받기';
+  $('btnUpdate').title = 'Windows용 StepViewer.exe 받기 (파일 더블클릭으로 열기 지원)';
+  $('btnUpdate').onclick = () => window.open('https://github.com/David-K6/StepViewer/releases/latest', '_blank', 'noopener');
+} else if (!LOCAL_SERVER) $('btnUpdate').classList.add('hidden');
 $('btnHelpClose').onclick = () => $('help').classList.add('hidden');
 
 function connectServer() {
-  if (location.protocol === 'file:') return;
+  if (!LOCAL_SERVER) return;
   // the id ties the goodbye beacon to this window's event stream (server: closed vs. merely dropped)
   const cid = Math.random().toString(36).slice(2) + Date.now().toString(36);
   const es = new EventSource(`/api/events?cid=${cid}`);

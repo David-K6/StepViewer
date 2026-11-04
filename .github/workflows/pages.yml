@@ -1,0 +1,39 @@
+# Publishes the web version (same app as StepViewer.exe) to GitHub Pages on every push to main
+# (the github-pages environment only accepts deployments from main; releases are cut from main).
+name: Web version (GitHub Pages)
+
+on:
+  push:
+    branches: [main]
+    paths: ['app/**', 'scripts/web.js', 'scripts/vendor.js', 'package.json', 'package-lock.json', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run web
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/web
+      - id: deployment
+        uses: actions/deploy-pages@v4

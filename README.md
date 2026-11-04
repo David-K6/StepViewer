@@ -11,6 +11,14 @@ A lightweight STEP / IGES / BREP / **SolidWorks (SLDPRT, SLDASM)** viewer. It ru
 - StepViewer quits automatically once the last viewer window is closed. The log is written to `%TEMP%\StepViewer.log`.
 - **Updates:** "업데이트 확인" (top right) compares the running version with the latest GitHub release. If a newer one exists, "업데이트" downloads it, replaces `StepViewer.exe` in place and restarts (open files are closed; the window reloads itself). The exe's folder must be writable; otherwise download it from the releases page. Versions before 0.0.4 have no updater, so install 0.0.4 once by hand.
 
+## Web version
+
+The same viewer runs in the browser at **https://david-k6.github.io/StepViewer/** with nothing to install. Files are parsed inside the browser and are never uploaded; parsed models are cached in the browser (IndexedDB).
+
+- Open files with the 열기 button, Ctrl+O or drag and drop. For a SolidWorks assembly, select (or drop) the `.SLDASM` together with its part files, because a web page cannot read the files next to it.
+- Not available on the web: opening files by double-click / "Open with", and the in-app updater (the web version is always the latest release). The "데스크톱 앱 받기" button links to the exe.
+- It is published by `.github/workflows/pages.yml` on every push to `main` that touches the app (or run it by hand from the Actions tab).
+
 ## Features
 
 | Feature | How to use it |
@@ -54,6 +62,8 @@ npm start            # dev server (serves app/ from disk)
 npm run build        # dist/StepViewer.exe (Node SEA, GUI subsystem)
 npm run smoke -- testfiles/x.stp   # headless Edge test with assertions
 npm run swtest -- a.SLDASM --pair p.SLDPRT=p.step   # SolidWorks reader regression test
+npm run web          # build/web: static web version (what GitHub Pages serves)
+npm run webtest      # headless test of build/web served under /StepViewer/
 ```
 
-Releasing: set `version` in package.json, build, then create a GitHub release whose tag is exactly that version (e.g. `0.0.4`) with the exe attached as `StepViewer.exe`. The in-app updater relies on both.
+Releasing: set `version` in package.json, build, then create a GitHub release whose tag is exactly that version (e.g. `0.0.4`) with the exe attached as `StepViewer.exe`. The in-app updater relies on both. The web version is republished from `main` automatically.

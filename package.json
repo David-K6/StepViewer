@@ -9,7 +9,9 @@
     "vendor": "node scripts/vendor.js",
     "build": "node scripts/build.js",
     "smoke": "node scripts/smoke.js",
-    "swtest": "node scripts/swtest.js"
+    "swtest": "node scripts/swtest.js",
+    "web": "node scripts/vendor.js && node scripts/web.js",
+    "webtest": "node scripts/webtest.js"
   },
   "keywords": [],
   "author": "",
