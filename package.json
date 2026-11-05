@@ -1,6 +1,6 @@
 {
   "name": "stepviewer",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Lightweight STEP/IGES viewer (single exe)",
   "main": "server.js",
   "scripts": {
@@ -11,7 +11,8 @@
     "smoke": "node scripts/smoke.js",
     "swtest": "node scripts/swtest.js",
     "web": "node scripts/vendor.js && node scripts/web.js",
-    "webtest": "node scripts/webtest.js"
+    "webtest": "node scripts/webtest.js",
+    "xttest": "node scripts/xttest.js"
   },
   "keywords": [],
   "author": "",

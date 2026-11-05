@@ -3,8 +3,8 @@
 /* global occtimportjs */
 // When started from a blob (see main.js), the page hands over blob URLs of the scripts and the WASM it
 // prefetched, so new workers never depend on the local server still being reachable.
-const ASSETS = self.__svAssets || { occt: 'vendor/occt-import-js.js', sw: 'swfile.js', wasm: null };
-importScripts(ASSETS.occt, ASSETS.sw);
+const ASSETS = self.__svAssets || { occt: 'vendor/occt-import-js.js', sw: 'swfile.js', xt: 'xtfile.js', wasm: null };
+importScripts(ASSETS.occt, ASSETS.sw, ASSETS.xt);
 
 let occtPromise = null;
 function getOcct() {
@@ -20,12 +20,16 @@ const QUALITY = {
 
 // sRGB [0,1] -> linear byte (vertex colors are interpreted as linear by three.js)
 const lin = (c) => Math.round(255 * (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4)));
+// OpenCascade reports colors in linear RGB; the viewer (like the CAD file) works in sRGB
+const toSrgb = (c) => (c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
+const srgbColor = (c) => (Array.isArray(c) && c.length >= 3 ? c.slice(0, 3).map((x) => Math.min(1, Math.max(0, toSrgb(x)))) : null);
 
 function formatOf(name) {
   const ext = (name.split('.').pop() || '').toLowerCase();
   if (ext === 'sldprt' || ext === 'sldasm') return 'solidworks';
   if (ext === 'igs' || ext === 'iges') return 'iges';
   if (ext === 'brep' || ext === 'brp') return 'brep';
+  if (ext === 'x_t' || ext === 'xmt_txt') return 'parasolid';
   return 'step';
 }
 
@@ -117,10 +121,10 @@ function convertOcctMesh(m) {
   const normal = m.attributes.normal ? new Float32Array(m.attributes.normal.array) : null;
   const vCount = position.length / 3;
   const index = vCount < 65536 ? new Uint16Array(m.index.array) : new Uint32Array(m.index.array);
-  const faces = m.brep_faces || [];
+  const faces = (m.brep_faces || []).map((f) => ({ ...f, color: srgbColor(f.color) }));
   // per-face colors -> vertex colors only when faces differ from the mesh color
   let colors = null;
-  const base = m.color || null;
+  const base = srgbColor(m.color);
   const differs = faces.some((f) => f.color && (!base || f.color[0] !== base[0] || f.color[1] !== base[1] || f.color[2] !== base[2]));
   if (differs) {
     colors = new Uint8Array(vCount * 3);
@@ -155,6 +159,69 @@ function finish(meshes) {
     if (m.colors) transfer.push(m.colors.buffer);
   }
   return transfer;
+}
+
+/** OCCT meshes of the converted X_T -> one mesh per Parasolid body, named and grouped by the body names
+ *  ("part__body" and "a.step-1/b.step-1/solid1" paths, as Onshape and others write them) */
+function parasolidResult(res, conv, fileName) {
+  const byKey = new Map(conv.bodies.map((b, i) => [b.key, { ...b, no: i + 1 }]));
+  const meshes = [];
+  const root = { name: fileName.replace(/\.[^.]+$/, ''), meshes: [], children: [] };
+  const groups = new Map();
+  const groupOf = (segs) => {
+    let path = '', node = root;
+    for (const s of segs) {
+      path += '/' + s;
+      let n = groups.get(path);
+      if (!n) { n = { name: s, meshes: [], children: [] }; groups.set(path, n); node.children.push(n); }
+      node = n;
+    }
+    return node;
+  };
+  const nodes = [];
+  const walk = (n) => { if (byKey.has(n.name)) nodes.push(n); else for (const c of n.children || []) walk(c); };
+  walk(res.root);
+  for (const n of nodes) {
+    const b = byKey.get(n.name);
+    const parts = [];
+    const collect = (x) => { for (const mi of x.meshes || []) parts.push(convertOcctMesh(res.meshes[mi])); for (const c of x.children || []) collect(c); };
+    collect(n);
+    if (!parts.length) continue;
+    const m = parts.length === 1 ? parts[0] : mergeMeshes(parts);
+    if (b.color) m.color = b.color.slice(0, 3);
+    // "NONE" is the placeholder some writers use for unnamed bodies: number those within their group
+    const raw = b.name ? b.name.split('__').flatMap((s) => s.split('/')).map((s) => s.trim()).filter(Boolean) : [];
+    const named = raw.length && raw[raw.length - 1].toUpperCase() !== 'NONE';
+    const groupSegs = (named ? raw.slice(0, -1) : raw).filter((s) => s.toUpperCase() !== 'NONE');
+    const g = groupOf(groupSegs);
+    m.name = named ? raw[raw.length - 1] : `바디 ${g.meshes.length + 1}`;
+    g.meshes.push(meshes.length);
+    meshes.push(m);
+  }
+  if (!meshes.length) throw new Error('X_T 파일의 형상을 표시하지 못했습니다.');
+  return { meshes, tree: root };
+}
+/** several OCCT meshes of one body (one per shell) -> one mesh */
+function mergeMeshes(list) {
+  let nv = 0, ni = 0, nf = 0;
+  for (const m of list) { nv += m.position.length; ni += m.index.length; nf += m.faceFirst.length; }
+  const position = new Float32Array(nv), normal = list.every((m) => m.normal) ? new Float32Array(nv) : null;
+  const index = new Uint32Array(ni), faceFirst = new Int32Array(nf), faceLast = new Int32Array(nf);
+  const colors = list.some((m) => m.colors) ? new Uint8Array(nv) : null;
+  let ov = 0, oi = 0, of = 0, ot = 0;
+  for (const m of list) {
+    position.set(m.position, ov);
+    if (normal) normal.set(m.normal, ov);
+    if (colors) {
+      if (m.colors) colors.set(m.colors, ov);
+      else { const c = (m.color || [0.72, 0.75, 0.8]).map(lin); for (let v = ov; v < ov + m.position.length; v += 3) { colors[v] = c[0]; colors[v + 1] = c[1]; colors[v + 2] = c[2]; } }
+    }
+    const base = ov / 3;
+    for (let k = 0; k < m.index.length; k++) index[oi + k] = m.index[k] + base;
+    for (let k = 0; k < m.faceFirst.length; k++) { faceFirst[of + k] = m.faceFirst[k] + ot; faceLast[of + k] = m.faceLast[k] + ot; }
+    ov += m.position.length; oi += m.index.length; of += m.faceFirst.length; ot += m.index.length / 3;
+  }
+  return { name: list[0].name, color: list[0].color, position, normal, index, colors, faceFirst, faceLast };
 }
 
 async function readOcct(name, bytes, quality) {
@@ -192,6 +259,19 @@ onmessage = async (ev) => {
       const tEnd = performance.now();
       postMessage({ id, ok: true, tree: r.tree, meshes: r.meshes, missing: r.missing, usedSiblings: r.usedSiblings, invalidFaces: r.invalidFaces || 0,
         timing: { init: 0, parse: tParse - t0, post: tEnd - tParse } }, transfer);
+      return;
+    }
+    if (formatOf(name) === 'parasolid') {
+      await getOcct();
+      const tInit = performance.now();
+      const conv = XTFile.toStep(bytes);
+      const res = await readOcct(name.replace(/\.[^.]+$/, '') + '.step', new TextEncoder().encode(conv.step), quality);
+      const tParse = performance.now();
+      const { meshes, tree } = parasolidResult(res, conv, name);
+      const transfer = finish(meshes);
+      const tEnd = performance.now();
+      const st = conv.stats;
+      postMessage({ id, ok: true, tree, meshes, xtSkipped: { faces: st.skippedFaces, bodies: st.failedBodies || 0 }, timing: { init: tInit - t0, parse: tParse - tInit, post: tEnd - tParse } }, transfer);
       return;
     }
     await getOcct();

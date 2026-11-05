@@ -221,8 +221,74 @@ async function runUpdate() {
   }
 }
 
+// ---- saving exports ----
+function defaultSaveDir() {
+  for (const d of [path.join(os.homedir(), 'Documents'), path.join(os.homedir(), 'OneDrive', 'Documents'), os.homedir()]) {
+    try { if (fs.statSync(d).isDirectory()) return d; } catch { /* next */ }
+  }
+  return os.homedir();
+}
+const SAVE_EXT = /\.(dxf)$/i;
+/** write an export: only a plain file name with an allowed extension, into an existing absolute folder */
+function saveExport(body) {
+  const dir = typeof body.dir === 'string' ? body.dir.trim() : '';
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!dir || !path.isAbsolute(dir)) return { error: '저장 폴더는 전체 경로(예: C:\\Users\\...\\Documents)로 입력해 주세요.' };
+  if (!name || /[\\/:*?"<>|]/.test(name) || name === '.' || name === '..') return { error: '파일 이름에 사용할 수 없는 문자가 있습니다 ( \\ / : * ? " < > | ).' };
+  if (!SAVE_EXT.test(name)) return { error: '파일 이름은 .dxf로 끝나야 합니다.' };
+  if (typeof body.content !== 'string') return { error: '저장할 내용이 없습니다.' };
+  try { if (!fs.statSync(dir).isDirectory()) return { error: `폴더가 아닙니다: ${dir}` }; } catch { return { error: `폴더를 찾을 수 없습니다: ${dir}` }; }
+  const file = path.join(dir, name);
+  try {
+    if (!body.overwrite) fs.writeFileSync(file, body.content, { encoding: 'utf8', flag: 'wx' });
+    else {
+      // write a new file and rename it over the old name: a hard link or symlink at that name is replaced,
+      // the file it pointed to is never written
+      let st = null;
+      try { st = fs.lstatSync(file); } catch { /* gone meanwhile */ }
+      if (st && st.isDirectory()) return { error: `같은 이름의 폴더가 있습니다: ${name}` };
+      const tmp = path.join(dir, `.${name}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+      fs.writeFileSync(tmp, body.content, { encoding: 'utf8', flag: 'wx' });
+      try { fs.renameSync(tmp, file); } catch (e) { try { fs.unlinkSync(tmp); } catch { /* ignore */ } throw e; }
+    }
+  } catch (e) {
+    if (e.code === 'EEXIST') return { error: `같은 이름의 파일이 이미 있습니다: ${name}`, exists: true, path: file };
+    return { error: `저장하지 못했습니다 (${e.code || e.message}).` };
+  }
+  log('saved export', file);
+  return { ok: true, path: file };
+}
+/** native folder picker (Windows); resolves to the chosen folder or null */
+function pickFolder(initial) {
+  if (process.platform !== 'win32') return Promise.resolve(null);
+  // the initial folder goes through the environment, never into the script text
+  const script = [
+    '[Console]::OutputEncoding = [Text.Encoding]::UTF8',
+    'Add-Type -AssemblyName System.Windows.Forms',
+    '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
+    "$d.Description = '저장할 폴더를 선택하세요'",
+    '$d.ShowNewFolderButton = $true',
+    'if ($env:SV_INITIAL -and (Test-Path -LiteralPath $env:SV_INITIAL)) { $d.SelectedPath = $env:SV_INITIAL }',
+    '$o = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false; Width = 1; Height = 1; StartPosition = "CenterScreen" }',
+    '$o.Show(); $o.Activate()',
+    'if ($d.ShowDialog($o) -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }',
+    '$o.Close()',
+  ].join('; ');
+  return new Promise((resolve) => {
+    let out = '';
+    let child;
+    try {
+      child = spawn('powershell.exe', ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        { env: { ...process.env, SV_INITIAL: initial || '' }, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch { return resolve(null); }
+    child.stdout.on('data', (c) => { out += c.toString('utf8'); });
+    child.once('error', () => resolve(null));
+    child.once('exit', () => resolve(out.trim() || null));
+  });
+}
+
 // ---- files passed on the command line / forwarded from other instances ----
-const STEP_EXT = /\.(step|stp|iges|igs|brep|brp|sldprt|sldasm)$/i;
+const STEP_EXT = /\.(step|stp|iges|igs|brep|brp|sldprt|sldasm|x_t|xmt_txt)$/i;
 const fileRegistry = new Map(); // id -> absolute path
 let nextFileId = 1;
 const pendingOpen = []; // ids not yet delivered to any client
@@ -264,7 +330,7 @@ function fileInfo(id) {
   const p = fileRegistry.get(id);
   let size = 0, mtime = 0;
   try { const st = fs.statSync(p); size = st.size; mtime = st.mtimeMs; } catch { /* ignore */ }
-  return { id, name: path.basename(p), size, mtime };
+  return { id, name: path.basename(p), size, mtime, dir: path.dirname(p) };
 }
 
 // ---- SSE clients (used for liveness + push "open file" events) ----
@@ -305,11 +371,11 @@ function json(res, code, obj) {
   res.end(body);
 }
 
-function readBody(req) {
+function readBody(req, max = 1e6) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
-    req.on('data', (c) => { total += c.length; if (total > 1e6) { reject(new Error('too large')); req.destroy(); } else chunks.push(c); });
+    req.on('data', (c) => { total += c.length; if (total > max) { reject(new Error('too large')); req.destroy(); } else chunks.push(c); });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
@@ -325,6 +391,22 @@ function createServer(initialIds) {
       if (p === '/api/hello') return json(res, 200, { app: APP_ID, pid: process.pid, version: getVersion() });
 
       // update endpoints: the custom header makes cross-site requests need a CORS preflight (which we never grant)
+      // saving exported files (DXF) where the user chose; the custom header keeps other sites out (CORS preflight)
+      if (p.startsWith('/api/save/')) {
+        if (req.headers['x-stepviewer'] !== '1') return json(res, 403, { error: 'forbidden' });
+        if (p === '/api/save/defaults' && req.method === 'GET') return json(res, 200, { dir: defaultSaveDir() });
+        if (p === '/api/save/pick-folder' && req.method === 'POST') {
+          const body = JSON.parse(await readBody(req) || '{}');
+          return json(res, 200, { path: await pickFolder(typeof body.initial === 'string' ? body.initial : '') });
+        }
+        if (p === '/api/save/file' && req.method === 'POST') {
+          const body = JSON.parse(await readBody(req, 64e6) || '{}');
+          const r = saveExport(body);
+          return json(res, r.error && !r.exists ? 400 : 200, r); // "already exists" is an answer, not a failure
+        }
+        return json(res, 404, { error: 'not found' });
+      }
+
       if (p.startsWith('/api/update/')) {
         if (req.headers['x-stepviewer'] !== '1') return json(res, 403, { error: 'forbidden' });
         if (p === '/api/update/check' && req.method === 'GET') {

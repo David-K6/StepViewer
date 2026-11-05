@@ -1,6 +1,6 @@
 # StepViewer
 
-A lightweight STEP / IGES / BREP / **SolidWorks (SLDPRT, SLDASM)** viewer. It runs from a single executable: `dist\StepViewer.exe`.
+A lightweight STEP / IGES / BREP / **SolidWorks (SLDPRT, SLDASM)** / **Parasolid (X_T)** viewer. It runs from a single executable: `dist\StepViewer.exe`.
 
 ## Running it
 
@@ -30,6 +30,17 @@ The same viewer runs in the browser at **https://david-k6.github.io/StepViewer/*
 | Transparency | Per part: select it and use the transparency slider. Whole model: the "전체 투명도" (overall transparency) slider. |
 | Section view | X opens the panel. Each of the X, Y and Z planes can be turned on and moved separately (slider, number, or left-drag the blue plane in the view while the panel is open), and you can also define a plane by picking a face. Cut faces are filled solid (stencil caps) and part boundaries on them are drawn as lines. |
 | Measurement | Distance (D), angle (A), radius/diameter (R: click a round edge or a cylindrical / partial cylindrical face, or pick 3 points), face area and normal (G). Snaps to vertices and edges; hold Shift to turn snapping off. Shift+C clears all measurements and the selection. |
+| Pick faces / edges / vertices | Click a selected part again to pick the face, edge or vertex under the cursor (click it again to release it). One pick shows its data: face area and plane normal or cylinder radius, edge length and line direction or arc radius, vertex coordinates. A second pick (on the same part, or on another part selected with Ctrl+click) shows the shortest distance with ΔX/ΔY/ΔZ, the angle between planes or lines, the distance between parallel planes, lines or cylinder axes and between circle centers. "측정에 추가" keeps it in the measurement list; Esc releases the picks. |
+| Face actions | Right-click a picked face: "면에 수직으로 보기" turns the view to look straight at it. For a plane, "DXF로 내보내기…" writes the face outline seen from its front (LINE / ARC / CIRCLE, holes included) in mm, cm, m, µm, inch or ft to the folder and file name you choose. In the web version the browser's save dialog is used. |
+
+## Parasolid files (X_T)
+
+Text transmit files (`.x_t`, `.xmt_txt`) from current Onshape, SolidWorks, NX and other Parasolid-based systems open directly. The binary form (`.x_b`) is not supported.
+
+- The B-rep (planes, cylinders, cones, spheres, tori, B-spline and swept surfaces; lines, circles, ellipses, B-spline curves) is converted to STEP in the worker and tessellated by OpenCascade like a STEP file. Edges stored only as surface-parametric or intersection curves are approximated to within 1 µm.
+- Each Parasolid body becomes a part. Names and colors come from the file's attributes; `part__body` and `a/b/c` body names become the tree.
+- Checked against STEP exports of the same parts: face count, surface area and bounding box are identical. A 24 MB, 621-body Onshape assembly opens in about 15 s (then from the cache), and every solid in it tessellates closed.
+- Not supported yet: blend (rolling-ball) and spun surfaces; faces on them are skipped with a warning.
 
 ## SolidWorks files (SLDPRT / SLDASM)
 
@@ -62,6 +73,7 @@ npm start            # dev server (serves app/ from disk)
 npm run build        # dist/StepViewer.exe (Node SEA, GUI subsystem)
 npm run smoke -- testfiles/x.stp   # headless Edge test with assertions
 npm run swtest -- a.SLDASM --pair p.SLDPRT=p.step   # SolidWorks reader regression test
+npm run xttest -- a.x_t --ref a.step                 # Parasolid reader regression test
 npm run web          # build/web: static web version (what GitHub Pages serves)
 npm run webtest      # headless test of build/web served under /StepViewer/
 ```

@@ -58,10 +58,10 @@ const workerAssetsReady = (async () => {
       if (!r.ok) throw new Error(`${u}: ${r.status}`);
       return URL.createObjectURL(new Blob([await r.arrayBuffer()], { type }));
     };
-    const [occt, sw, wasm, wk] = await Promise.all([
-      blobUrl('vendor/occt-import-js.js', 'text/javascript'), blobUrl('swfile.js', 'text/javascript'),
+    const [occt, sw, xt, wasm, wk] = await Promise.all([
+      blobUrl('vendor/occt-import-js.js', 'text/javascript'), blobUrl('swfile.js', 'text/javascript'), blobUrl('xtfile.js', 'text/javascript'),
       blobUrl('vendor/occt-import-js.wasm', 'application/wasm'), blobUrl('worker.js', 'text/javascript')]);
-    const boot = `self.__svAssets=${JSON.stringify({ occt, sw, wasm })};importScripts(${JSON.stringify(wk)});`;
+    const boot = `self.__svAssets=${JSON.stringify({ occt, sw, xt, wasm })};importScripts(${JSON.stringify(wk)});`;
     workerUrl = URL.createObjectURL(new Blob([boot], { type: 'text/javascript' }));
   } catch (e) { console.warn('[StepViewer] worker prefetch failed, using the server copy', e); }
 })();
@@ -267,6 +267,7 @@ function activateTab(tab) {
   syncToolbar();
   syncSectionUI();
   renderMeasureList();
+  renderEntityPanel(tab);
   updateStatus();
   $('loading').classList.toggle('hidden', !(tab && tab.loading));
   if (tab && tab.loading) $('loadingText').textContent = `${tab.name} 해석 중…`;
@@ -287,6 +288,8 @@ function closeTab(tab) {
   for (const e of tab.edgeObjs) { e.geometry.dispose(); e.material.dispose(); }
   for (const m of tab.measures) disposeMeasure(m);
   if (tab.pending) { disposeMeasure(tab.pending); tab.pending = null; }
+  if (tab.entGroup) { clearGroup(tab.entGroup); clearGroup(tab.entHoverGroup); tab.entities = []; }
+  for (const p of tab.parts) disposeFaceCache(p);
   disposeSectionObjs(tab);
   tab.scene.clear(); tab.overlay.clear();
   if (active === tab) { active = null; activateTab(tabs[Math.min(i, tabs.length - 1)] || null); }
@@ -295,7 +298,7 @@ function closeTab(tab) {
 }
 
 // ---------------------------------------------------------------- loading
-const CAD_EXT = /\.(step|stp|iges|igs|brep|brp|sldprt|sldasm)$/i;
+const CAD_EXT = /\.(step|stp|iges|igs|brep|brp|sldprt|sldasm|x_t|xmt_txt)$/i;
 const isAsm = (n) => /\.sldasm$/i.test(n);
 
 /** SolidWorks keeps original reference names ("rear container.SLDPRT") while Pack and Go adds
@@ -402,15 +405,15 @@ async function loadBuffer(name, getBuffer, size, resolveFile = null) {
   }, 200);
   try {
     const quality = $('quality').value;
-    const buffer = await getBuffer();
+    const buffer = await getBuffer(tab);
     if (!size) size = buffer.byteLength;
     // cache key = file content hash (not name/mtime), so different files can never collide
     const hash = await contentHash(buffer);
     const popt = window.__svParseOpts && Object.keys(window.__svParseOpts).length ? '|' + JSON.stringify(window.__svParseOpts) : '';
     // v3: entries written by older versions (no corrupted-face filtering, cached partial assemblies) are ignored
-    // sw2: SolidWorks results now carry the files' appearance colors
-    const fmtVer = /\.sld(prt|asm)$/i.test(name) ? 'sw2|' : '';
-    const cacheKey = hash ? `v3|${fmtVer}${quality}${popt}|${buffer.byteLength}|${hash}` : null;
+    // sw2: SolidWorks results carry the files' appearance colors; v4: OpenCascade colors are converted to sRGB
+    const fmtVer = /\.sld(prt|asm)$/i.test(name) ? 'sw2|' : /\.(x_t|xmt_txt)$/i.test(name) ? 'xt1|' : '';
+    const cacheKey = hash ? `v4|${fmtVer}${quality}${popt}|${buffer.byteLength}|${hash}` : null;
     let result = cacheKey ? await cacheGet(cacheKey) : null;
     // results depending on other files must never come from the cache (older versions could store them)
     if (result && ((result.missing && result.missing.length) || (result.usedSiblings && result.usedSiblings.length) || !cachedGeometryOk(result))) result = null;
@@ -436,6 +439,8 @@ async function loadBuffer(name, getBuffer, size, resolveFile = null) {
       warn.push(`표시 데이터가 없는 부품 ${tab.missing.length}개를 건너뛰었습니다 (${list}). 부품(또는 원본 STEP) 파일을 같은 폴더에 두고 열거나, 조립품과 함께 끌어다 놓으세요.`);
     }
     if (result.invalidFaces) warn.push(`손상된 표시 데이터 면 ${result.invalidFaces}개를 건너뛰었습니다. 파일이 손상되었을 수 있습니다.`);
+    const xs = result.xtSkipped;
+    if (xs && (xs.faces || xs.bodies)) warn.push(`지원하지 않는 Parasolid 형상이 있어 ${xs.faces ? `면 ${xs.faces}개` : ''}${xs.faces && xs.bodies ? ', ' : ''}${xs.bodies ? `바디 ${xs.bodies}개` : ''}를 표시하지 못했습니다.`);
     if (warn.length) toast(`${name}: ${warn.join(' / ')}`, true);
     if (active === tab) {
       controls.enabled = true;
@@ -850,16 +855,16 @@ function worldPerPixel(tab, point) {
 }
 
 // Snap to CAD vertices (segment endpoints) or edges of the hit part near the cursor.
-function snapHit(hit, ev) {
+function snapHit(hit, ev, force = false) {
   if (!hit) return null;
   hit.snap = 'face';
   if (hit.cap) { hit.snap = 'cap'; return hit; }
-  if (!$('snapOn').checked || ev.shiftKey) return hit;
+  if (!force && (!$('snapOn').checked || ev.shiftKey)) return hit;
   const tab = active;
   const eps = tab.diag * 1e-7;
   const kept = (v) => !tab.clipPlanes.some((pl) => pl.distanceToPoint(v) < -eps);
   const wpp = worldPerPixel(tab, hit.point);
-  const tolEdge = wpp * 8, tolVert = wpp * 11;
+  const tolEdge = wpp * (force ? 5 : 8), tolVert = wpp * (force ? 7 : 11); // picking a face must stay easy next to its edges
   const e = hit.part.edges;
   const ray = raycaster.ray;
   const a = _v1, b = _v2, onSeg = new THREE.Vector3(), onRay = new THREE.Vector3();
@@ -893,22 +898,27 @@ function distSqPointSeg(p, a, b) {
 }
 
 // Walk the polyline of a CAD edge (through degree-2 vertices) starting at segment s.
+/** CAD-edge segment endpoints -> segments meeting there (key: position quantized to diag*1e-6) */
+function partAdj(tab, part) {
+  if (part.adj) return part.adj;
+  const e = part.edges;
+  const q = 1 / (tab.diag * 1e-6);
+  const adj = new Map();
+  for (let i = 0; i < e.length; i += 6) {
+    for (const off of [0, 3]) {
+      const k = `${Math.round(e[i + off] * q)},${Math.round(e[i + off + 1] * q)},${Math.round(e[i + off + 2] * q)}`;
+      let l = adj.get(k); if (!l) adj.set(k, (l = []));
+      l.push(i / 6);
+    }
+  }
+  part.adj = adj;
+  return adj;
+}
 function edgeChain(tab, part, s) {
   const e = part.edges;
   const q = 1 / (tab.diag * 1e-6);
   const key = (i) => `${Math.round(e[i] * q)},${Math.round(e[i + 1] * q)},${Math.round(e[i + 2] * q)}`;
-  if (!part.adj) {
-    const adj = new Map();
-    for (let i = 0; i < e.length; i += 6) {
-      for (const off of [0, 3]) {
-        const k = key(i + off);
-        let l = adj.get(k); if (!l) adj.set(k, (l = []));
-        l.push(i / 6);
-      }
-    }
-    part.adj = adj;
-  }
-  const adj = part.adj;
+  const adj = partAdj(tab, part);
   const pt = (seg, end) => new THREE.Vector3(e[seg * 6 + end * 3], e[seg * 6 + end * 3 + 1], e[seg * 6 + end * 3 + 2]);
   const used = new Set([s]);
   const walk = (seg, end) => {
@@ -1311,6 +1321,664 @@ function renderMeasureList() {
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
+// ---------------------------------------------------------------- face / edge / vertex selection
+// A click on an already selected part picks the face, edge or vertex under the cursor (vertex and edge
+// win within a few pixels, like measurement snapping). Two picked entities are measured against each other.
+const ENT_COLOR = 0x19d3ff;
+const entLineMat = new THREE.LineBasicMaterial({ color: ENT_COLOR, depthTest: false, transparent: true });
+const entLineHoverMat = new THREE.LineBasicMaterial({ color: ENT_COLOR, depthTest: false, transparent: true, opacity: 0.55 });
+const entPtMat = new THREE.PointsMaterial({ color: ENT_COLOR, size: 10, sizeAttenuation: false, depthTest: false, transparent: true });
+const entPtHoverMat = new THREE.PointsMaterial({ color: ENT_COLOR, size: 9, sizeAttenuation: false, depthTest: false, transparent: true, opacity: 0.55 });
+const ENT_SHARED_MATS = new Set([entLineMat, entLineHoverMat, entPtMat, entPtHoverMat, lineMat, ptMat, dashMat]);
+
+/** triangles, area, centroid and plane of one B-rep face (cached on the part) */
+function faceData(part, f) {
+  part.faceCache ||= new Map();
+  let d = part.faceCache.get(f);
+  if (d) return d;
+  const g = part.mesh.geometry;
+  const pos = g.getAttribute('position').array, idx = g.getIndex().array;
+  const first = f >= 0 ? part.faceFirst[f] : 0, last = f >= 0 ? part.faceLast[f] : -1;
+  const n = Math.max(0, last - first + 1);
+  const tri = new Float32Array(n * 9);
+  const A = new THREE.Vector3(), B = new THREE.Vector3(), C = new THREE.Vector3(), cr = new THREE.Vector3();
+  const cen = new THREE.Vector3(), nSum = new THREE.Vector3(), n0 = new THREE.Vector3();
+  let area = 0, planar = true, o = 0;
+  for (let t = first; t <= last; t++) {
+    A.fromArray(pos, idx[t * 3] * 3); B.fromArray(pos, idx[t * 3 + 1] * 3); C.fromArray(pos, idx[t * 3 + 2] * 3);
+    cr.crossVectors(_v1.copy(B).sub(A), _v2.copy(C).sub(A));
+    const ar = cr.length() / 2;
+    if (ar > 0) {
+      nSum.add(cr);
+      cr.normalize();
+      if (n0.lengthSq() === 0) n0.copy(cr);
+      else if (Math.abs(cr.dot(n0)) < 0.99995) planar = false;
+    }
+    area += ar;
+    cen.addScaledVector(_v3.copy(A).add(B).add(C).divideScalar(3), ar);
+    for (const P of [A, B, C]) { tri[o++] = P.x; tri[o++] = P.y; tri[o++] = P.z; }
+  }
+  if (area > 0) cen.divideScalar(area);
+  const normal = nSum.lengthSq() > 0 ? nSum.normalize() : n0.clone();
+  d = { f, first, last, tri, area, centroid: cen, planar: planar && n > 0, normal, geo: null };
+  part.faceCache.set(f, d);
+  return d;
+}
+function faceGeometry(d) {
+  if (!d.geo) {
+    d.geo = new THREE.BufferGeometry();
+    d.geo.setAttribute('position', new THREE.BufferAttribute(d.tri, 3));
+  }
+  return d.geo;
+}
+function faceBvh(d) { const g = faceGeometry(d); if (!g.boundsTree) g.computeBoundsTree(); return g.boundsTree; }
+/** the same triangles without a BVH: three-mesh-bvh's geometry-to-geometry query takes a faster path when the
+ *  other geometry has a BVH, and that path returns wrong distances against single-leaf BVHs (small faces) */
+function facePlain(d) {
+  if (!d.plain) { d.plain = new THREE.BufferGeometry(); d.plain.setAttribute('position', new THREE.BufferAttribute(d.tri, 3)); }
+  return d.plain;
+}
+function disposeFaceCache(part) {
+  if (!part.faceCache) return;
+  for (const d of part.faceCache.values()) {
+    if (d.geo) { d.geo.disposeBoundsTree?.(); d.geo.dispose(); }
+    if (d.plain) d.plain.dispose();
+  }
+  part.faceCache = null;
+}
+
+/** the entity under the cursor on a selected part: {kind: 'vertex'|'edge'|'face', part, ...} or null */
+function entityAt(e) { return entityFromHit(active, pick(e), e); }
+function entityFromHit(tab, hit, e) {
+  if (!hit || hit.cap || !tab.selection.has(hit.part)) return null;
+  hit = snapHit({ ...hit, point: hit.point.clone() }, e, true);
+  const part = hit.part;
+  if (hit.snap === 'vertex') {
+    const p = hit.point.clone();
+    return { kind: 'vertex', part, point: p, key: `${part.id}:v:${p.toArray().map((x) => x.toFixed(5)).join(',')}` };
+  }
+  if (hit.snap === 'edge') {
+    const chain = edgeChain(tab, part, hit.seg);
+    let len = 0;
+    for (let i = 1; i < chain.pts.length; i++) len += chain.pts[i].distanceTo(chain.pts[i - 1]);
+    if (chain.closed) len += chain.pts[chain.pts.length - 1].distanceTo(chain.pts[0]);
+    const c = new THREE.Vector3();
+    for (const p of chain.pts) c.add(p);
+    c.divideScalar(chain.pts.length);
+    return { kind: 'edge', part, pts: chain.pts, closed: chain.closed, length: len, point: hit.point.clone(), key: `${part.id}:e:${c.toArray().map((x) => x.toFixed(4)).join(',')}:${chain.pts.length}` };
+  }
+  const f = brepFaceOf(part, hit.tri);
+  if (f < 0) return null;
+  return { kind: 'face', part, f, point: hit.point.clone(), viewNormal: hit.normal.clone(), key: `${part.id}:f:${f}` };
+}
+
+/** geometric description of an entity (lines for the panel + values for pair measurements) */
+function describeEntity(tab, ent) {
+  if (ent.desc) return ent.desc;
+  const L = [];
+  const d = { lines: L };
+  const P = (v) => `(${fmt(v.x)}, ${fmt(v.y)}, ${fmt(v.z)})`;
+  if (ent.kind === 'vertex') {
+    L.push(`<b>꼭짓점</b> ${P(ent.point)}`);
+  } else if (ent.kind === 'edge') {
+    L.push(`<b>모서리 길이 ${fmt(ent.length)} mm</b>`);
+    const circ = fitCircleChain(ent.pts);
+    const a = ent.pts[0], b = ent.pts[ent.pts.length - 1];
+    let straight = !ent.closed && ent.pts.length >= 2 && a.distanceTo(b) > 0;
+    if (straight) {
+      const ab = b.clone().sub(a), l2 = ab.lengthSq();
+      const tol = Math.max(ent.length * 1e-4, tab.diag * 1e-7);
+      for (const p of ent.pts) { const t = _v1.copy(p).sub(a).dot(ab) / l2; if (_v2.copy(a).addScaledVector(ab, t).distanceTo(p) > tol) { straight = false; break; } }
+    }
+    if (straight) {
+      d.dir = b.clone().sub(a).normalize();
+      d.linePt = a.clone();
+      L.push(`직선 · 방향 ${P(d.dir).replace(/(\.\d{3})\d*/g, '$1')}`);
+    } else if (circ) {
+      d.center = circ.center; d.radius = circ.radius; d.axis = circ.normal;
+      L.push(`${ent.closed ? '원' : '호'} · Ø ${fmt(circ.radius * 2)}  R ${fmt(circ.radius)} mm`, `중심 ${P(circ.center)}`);
+    } else L.push('곡선');
+  } else {
+    const fd = faceData(ent.part, ent.f);
+    d.face = fd;
+    L.push(`<b>면적 ${fmt(fd.area)} mm²</b>`);
+    if (fd.planar) {
+      const n = fd.normal.clone();
+      if (n.dot(ent.viewNormal) < 0) n.negate();
+      d.normal = n;
+      d.planePt = fd.centroid.clone();
+      L.push(`평면 · 법선 (${fmt(n.x, 4)}, ${fmt(n.y, 4)}, ${fmt(n.z, 4)})`);
+    } else {
+      const cyl = fitCylinderFace(tab, { part: ent.part, tri: fd.first, point: fd.centroid });
+      if (cyl) {
+        d.center = cyl.center; d.radius = cyl.radius; d.axis = cyl.normal; d.cyl = true;
+        L.push(`원통면 · Ø ${fmt(cyl.radius * 2)}  R ${fmt(cyl.radius)} mm`, `축 (${fmt(cyl.normal.x, 4)}, ${fmt(cyl.normal.y, 4)}, ${fmt(cyl.normal.z, 4)}) · 길이 ${fmt(cyl.length)} mm`);
+      } else L.push('곡면');
+    }
+    L.push(`중심 ${P(fd.centroid)}`);
+  }
+  L.push(`<span class="muted">${escapeHtml(ent.part.name)}</span>`);
+  ent.desc = d;
+  return d;
+}
+
+// ---- closest points between entities
+function closestOnSeg(p, a, b, out) {
+  const ab = _v1.copy(b).sub(a), l2 = ab.lengthSq();
+  const t = l2 > 0 ? Math.min(1, Math.max(0, _v2.copy(p).sub(a).dot(ab) / l2)) : 0;
+  return out.copy(a).addScaledVector(ab, t);
+}
+/** closest points of segments p1-q1 and p2-q2 (Ericson, Real-Time Collision Detection 5.1.9) */
+function closestSegSeg(p1, q1, p2, q2, c1, c2) {
+  const d1 = q1.clone().sub(p1), d2 = q2.clone().sub(p2), r = p1.clone().sub(p2);
+  const a = d1.dot(d1), e = d2.dot(d2), f = d2.dot(r);
+  let s, t;
+  if (a <= 1e-18 && e <= 1e-18) { s = t = 0; }
+  else if (a <= 1e-18) { s = 0; t = Math.min(1, Math.max(0, f / e)); }
+  else {
+    const c = d1.dot(r);
+    if (e <= 1e-18) { t = 0; s = Math.min(1, Math.max(0, -c / a)); }
+    else {
+      const b = d1.dot(d2), den = a * e - b * b;
+      s = den > 1e-18 ? Math.min(1, Math.max(0, (b * f - c * e) / den)) : 0;
+      t = (b * s + f) / e;
+      if (t < 0) { t = 0; s = Math.min(1, Math.max(0, -c / a)); }
+      else if (t > 1) { t = 1; s = Math.min(1, Math.max(0, (b - c) / a)); }
+    }
+  }
+  c1.copy(p1).addScaledVector(d1, s);
+  c2.copy(p2).addScaledVector(d2, t);
+  return c1.distanceTo(c2);
+}
+function segmentsOf(ent) {
+  const s = [];
+  for (let i = 1; i < ent.pts.length; i++) s.push([ent.pts[i - 1], ent.pts[i]]);
+  if (ent.closed && ent.pts.length > 2) s.push([ent.pts[ent.pts.length - 1], ent.pts[0]]);
+  return s;
+}
+/** per triangle of a face: bounding sphere (center xyz, radius) */
+function faceSpheres(fd) {
+  if (fd.spheres) return fd.spheres;
+  const s = new Float64Array((fd.tri.length / 9) * 4), t = fd.tri; // float64: far from the origin float32 centers round off
+  for (let i = 0, o = 0; i < t.length; i += 9, o += 4) {
+    const cx = (t[i] + t[i + 3] + t[i + 6]) / 3, cy = (t[i + 1] + t[i + 4] + t[i + 7]) / 3, cz = (t[i + 2] + t[i + 5] + t[i + 8]) / 3;
+    let r = 0;
+    for (let k = 0; k < 9; k += 3) r = Math.max(r, Math.hypot(t[i + k] - cx, t[i + k + 1] - cy, t[i + k + 2] - cz));
+    s[o] = cx; s[o + 1] = cy; s[o + 2] = cz; s[o + 3] = r * (1 + 1e-9) + Math.max(Math.abs(cx), Math.abs(cy), Math.abs(cz), r) * 1e-12;
+  }
+  return (fd.spheres = s);
+}
+/** closest points between segment a-b (c1) and triangle T (c2) */
+const _segRay = new THREE.Ray();
+function segTriangle(a, b, T, c1, c2, tmp) {
+  // the segment pierces the triangle
+  const dir = tmp.copy(b).sub(a), len = dir.length();
+  if (len > 0) {
+    _segRay.set(a, dir.divideScalar(len));
+    const hit = _segRay.intersectTriangle(T.a, T.b, T.c, false, c1);
+    if (hit && hit.distanceTo(a) <= len) { c2.copy(hit); return 0; }
+  }
+  let best = Infinity;
+  const p = new THREE.Vector3(), q = new THREE.Vector3();
+  for (const e of [a, b]) { T.closestPointToPoint(e, q); const d = q.distanceTo(e); if (d < best) { best = d; c1.copy(e); c2.copy(q); } }
+  for (const [u, v] of [[T.a, T.b], [T.b, T.c], [T.c, T.a]]) {
+    const d = closestSegSeg(a, b, u, v, p, q);
+    if (d < best) { best = d; c1.copy(p); c2.copy(q); }
+  }
+  return best;
+}
+
+/** {a, b, d}: closest point on entity A, on entity B, distance */
+function closestBetween(A, B) {
+  const kindOrder = { vertex: 0, edge: 1, face: 2 };
+  if (kindOrder[A.kind] > kindOrder[B.kind]) { const r = closestBetween(B, A); return { a: r.b, b: r.a, d: r.d }; }
+  const best = { a: new THREE.Vector3(), b: new THREE.Vector3(), d: Infinity };
+  const c1 = new THREE.Vector3(), c2 = new THREE.Vector3();
+  const take = (d, p, q) => { if (d < best.d) { best.d = d; best.a.copy(p); best.b.copy(q); } };
+  const toFace = (p, fd) => { const t = {}; faceBvh(fd).closestPointToPoint(p, t); return t; };
+  if (A.kind === 'vertex') {
+    if (B.kind === 'vertex') take(A.point.distanceTo(B.point), A.point, B.point);
+    else if (B.kind === 'edge') for (const [a, b] of segmentsOf(B)) { closestOnSeg(A.point, a, b, c2); take(A.point.distanceTo(c2), A.point, c2); }
+    else { const t = toFace(A.point, faceData(B.part, B.f)); take(t.distance, A.point, t.point); }
+  } else if (A.kind === 'edge') {
+    if (B.kind === 'edge') {
+      for (const [a, b] of segmentsOf(A)) for (const [p, q] of segmentsOf(B)) take(closestSegSeg(a, b, p, q, c1, c2), c1, c2);
+    } else { // edge to face: exact segment-triangle distances, triangles culled by their bounding spheres
+      const fd = faceData(B.part, B.f);
+      const spheres = faceSpheres(fd);
+      const T = new THREE.Triangle(), on = new THREE.Vector3(), q = new THREE.Vector3();
+      for (const [a, b] of segmentsOf(A)) {
+        for (let i = 0, ti = 0; i < fd.tri.length; i += 9, ti += 4) {
+          on.set(spheres[ti], spheres[ti + 1], spheres[ti + 2]);
+          if (Math.sqrt(distSqPointSeg(on, a, b)) - spheres[ti + 3] >= best.d) continue;
+          T.a.fromArray(fd.tri, i); T.b.fromArray(fd.tri, i + 3); T.c.fromArray(fd.tri, i + 6);
+          segTriangle(a, b, T, c1, c2, q);
+          take(c1.distanceTo(c2), c1, c2);
+        }
+      }
+    }
+  } else { // face to face: exact triangle-triangle closest points
+    let fa = faceData(A.part, A.f), fb = faceData(B.part, B.f), swap = false;
+    if (fa.tri.length < fb.tri.length) { [fa, fb] = [fb, fa]; swap = true; } // the BVH on the larger face
+    const t1 = {}, t2 = {};
+    faceBvh(fa).closestPointToGeometry(facePlain(fb), new THREE.Matrix4(), t1, t2);
+    if (swap) { const t = t1.point; t1.point = t2.point; t2.point = t; }
+    if (t1.point && t2.point) take(t1.point.distanceTo(t2.point), t1.point, t2.point);
+  }
+  return best;
+}
+
+/** tessellated planes and straight edges have exact directions, so "parallel" can be strict */
+const PARALLEL_DEG = 0.05;
+/** measurement lines for a pair of entities */
+function measurePair(tab, A, B) {
+  const da = describeEntity(tab, A), db = describeEntity(tab, B);
+  const c = closestBetween(A, B);
+  const L = [];
+  if (A.kind === 'vertex' && B.kind === 'vertex') L.push(`<b>거리 ${fmt(c.d)} mm</b>`);
+  else L.push(`<b>최단 거리 ${fmt(c.d)} mm</b>`);
+  const dv = c.b.clone().sub(c.a);
+  L.push(`ΔX ${fmt(dv.x)}  ΔY ${fmt(dv.y)}  ΔZ ${fmt(dv.z)}`);
+  const deg = (x) => THREE.MathUtils.radToDeg(x);
+  const angleBetween = (u, v) => deg(Math.acos(Math.min(1, Math.abs(u.dot(v))))); // 0..90 degrees
+  if (da.normal && db.normal) {
+    const ang = angleBetween(da.normal, db.normal);
+    if (ang < PARALLEL_DEG) L.push(`평행 평면 (${fmt(ang, 3)}°) · 면간 거리 ${fmt(Math.abs(db.planePt.clone().sub(da.planePt).dot(da.normal)))} mm`);
+    else L.push(`면 사이 각도 ${fmt(deg(Math.acos(Math.min(1, Math.max(-1, da.normal.dot(db.normal))))), 3)}° (사잇각 ${fmt(ang, 3)}°)`);
+  }
+  if (da.dir && db.dir) {
+    const ang = angleBetween(da.dir, db.dir);
+    if (ang < PARALLEL_DEG) {
+      const w = db.linePt.clone().sub(da.linePt);
+      L.push(`평행 직선 (${fmt(ang, 3)}°) · 선간 거리 ${fmt(w.sub(da.dir.clone().multiplyScalar(w.dot(da.dir))).length())} mm`);
+    } else L.push(`직선 사이 각도 ${fmt(ang, 3)}°`);
+  }
+  const lineAndPlane = (dl, dp) => { if (dl.dir && dp.normal) L.push(`직선-평면 각도 ${fmt(90 - deg(Math.acos(Math.min(1, Math.abs(dl.dir.dot(dp.normal))))), 3)}°`); };
+  lineAndPlane(da, db); lineAndPlane(db, da);
+  if (da.center && db.center) {
+    if (da.axis && db.axis && angleBetween(da.axis, db.axis) < PARALLEL_DEG && (da.cyl || db.cyl)) {
+      const w = db.center.clone().sub(da.center);
+      L.push(`축간 거리 ${fmt(w.sub(da.axis.clone().multiplyScalar(w.dot(da.axis))).length())} mm`);
+    }
+    L.push(`중심 간 거리 ${fmt(da.center.distanceTo(db.center))} mm`);
+  }
+  return { lines: L, closest: c };
+}
+
+function entityOverlay(tab, ent, hover) {
+  const objs = [];
+  // own material per overlay: the section's clipping planes apply to it (disposed in clearGroup)
+  const clipped = (m) => { const c = m.clone(); c.clippingPlanes = tab.clipPlanes; return c; };
+  if (ent.kind === 'vertex') {
+    const p = mkPoints([ent.point]); p.material = clipped(hover ? entPtHoverMat : entPtMat); objs.push(p);
+  } else if (ent.kind === 'edge') {
+    const l = mkLine(ent.pts, ent.closed); l.material = clipped(hover ? entLineHoverMat : entLineMat); objs.push(l);
+  } else {
+    const fd = faceData(ent.part, ent.f);
+    const m = new THREE.Mesh(faceGeometry(fd), new THREE.MeshBasicMaterial({
+      color: ENT_COLOR, transparent: true, opacity: hover ? 0.28 : 0.5, side: THREE.DoubleSide, depthWrite: false,
+      polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3, clippingPlanes: tab.clipPlanes,
+    }));
+    m.raycast = () => {};
+    m.renderOrder = 900;
+    m.userData.sharedGeometry = true;
+    objs.push(m);
+  }
+  return objs;
+}
+function clearGroup(g) {
+  for (const o of [...g.children]) {
+    g.remove(o);
+    o.traverse((x) => {
+      if (x.isCSS2DObject) x.element.remove();
+      if (x.geometry && !x.userData.sharedGeometry) x.geometry.dispose();
+      if (x.material && !ENT_SHARED_MATS.has(x.material)) x.material.dispose();
+    });
+  }
+}
+function ensureEntityGroups(tab) {
+  if (!tab.entGroup) { tab.entGroup = new THREE.Group(); tab.overlay.add(tab.entGroup); }
+  if (!tab.entHoverGroup) { tab.entHoverGroup = new THREE.Group(); tab.overlay.add(tab.entHoverGroup); }
+  tab.entities ||= [];
+}
+function renderEntities(tab) {
+  ensureEntityGroups(tab);
+  clearGroup(tab.entGroup);
+  tab.entPair = null;
+  for (const ent of tab.entities) for (const o of entityOverlay(tab, ent, false)) tab.entGroup.add(o);
+  if (tab.entities.length === 2) {
+    const r = measurePair(tab, tab.entities[0], tab.entities[1]);
+    tab.entPair = r;
+    const { a, b, d } = r.closest;
+    if (d > 0) tab.entGroup.add(mkLine([a, b]));
+    tab.entGroup.add(mkPoints([a, b]));
+    const lbl = mkLabel(`${fmt(d)} mm`);
+    lbl.position.copy(a).add(b).multiplyScalar(0.5);
+    tab.entGroup.add(lbl);
+  }
+  renderEntityPanel(tab);
+  requestRender();
+}
+function renderEntityPanel(tab) {
+  const el = $('entityPanel');
+  const list = tab && tab.entities ? tab.entities : [];
+  el.classList.toggle('hidden', !list.length);
+  if (!list.length) return;
+  const KIND = { vertex: '점', edge: '모서리', face: '면' };
+  let html = '';
+  list.forEach((ent, i) => {
+    html += `<div class="ent"><span class="tag">${i + 1} ${KIND[ent.kind]}</span><div class="mv">${describeEntity(tab, ent).lines.join('<br>')}</div></div>`;
+  });
+  if (tab.entPair) html += `<div class="ent pair"><span class="tag">1↔2</span><div class="mv">${tab.entPair.lines.join('<br>')}</div></div>`;
+  else html += `<div class="hint">${list.length === 1 ? '같은 부품(또는 함께 선택한 부품)의 다른 면·모서리·점을 클릭하면 둘 사이를 측정합니다. 면에서 우클릭하면 수직 보기·DXF 내보내기.' : ''}</div>`;
+  $('entityBody').innerHTML = html;
+  $('btnEntPin').disabled = !tab.entPair;
+}
+function setEntities(tab, list) {
+  ensureEntityGroups(tab);
+  tab.entities = list;
+  renderEntities(tab);
+}
+function clickEntity(tab, ent) {
+  ensureEntityGroups(tab);
+  const cur = tab.entities;
+  const i = cur.findIndex((x) => x.key === ent.key);
+  if (i >= 0) setEntities(tab, cur.filter((_, k) => k !== i)); // clicking a picked entity again releases it
+  else setEntities(tab, cur.length >= 2 ? [ent] : [...cur, ent]);
+}
+/** drop entities of parts that are no longer selected or visible */
+function pruneEntities(tab) {
+  if (!tab || !tab.entities || !tab.entities.length) return;
+  const keep = tab.entities.filter((e) => tab.selection.has(e.part) && e.part.mesh.visible);
+  if (keep.length !== tab.entities.length) setEntities(tab, keep);
+}
+function setEntityHover(tab, ent) {
+  ensureEntityGroups(tab);
+  const key = ent ? ent.key : null;
+  if ((tab.entHoverKey || null) === key) return;
+  tab.entHoverKey = key;
+  clearGroup(tab.entHoverGroup);
+  if (ent && !tab.entities.some((x) => x.key === key)) for (const o of entityOverlay(tab, ent, true)) tab.entHoverGroup.add(o);
+  requestRender();
+}
+$('btnEntPin').onclick = () => {
+  const tab = active;
+  if (!tab || !tab.entPair) return;
+  const { a, b, d } = tab.entPair.closest;
+  addMeasure(tab, 'distance', tab.entPair.lines, `${fmt(d)} mm`, a.clone().add(b).multiplyScalar(0.5), [mkLine([a, b]), mkPoints([a, b])]);
+  $('measurePanel').classList.remove('hidden');
+};
+$('btnEntClear').onclick = () => { if (active) setEntities(active, []); };
+
+/** the face the face actions apply to: the latest picked face */
+function actionFace(tab) {
+  const list = (tab && tab.entities) || [];
+  for (let i = list.length - 1; i >= 0; i--) if (list[i].kind === 'face') return list[i];
+  return null;
+}
+/** look straight at a face (planar: along its normal; curved: along the normal where it was picked) */
+function viewNormalTo(tab, ent) {
+  const d = describeEntity(tab, ent);
+  const n = (d.normal || ent.viewNormal).clone().normalize();
+  const fd = faceData(ent.part, ent.f);
+  const cam = tab.camera;
+  // keep the current screen-up as far as possible
+  let up = cam.up.clone().addScaledVector(n, -cam.up.dot(n));
+  if (up.lengthSq() < 1e-6) up = Z_UP.clone().addScaledVector(n, -n.z);
+  if (up.lengthSq() < 1e-6) up = new THREE.Vector3(0, 1, 0).addScaledVector(n, -n.y);
+  up.normalize();
+  const box = new THREE.Box3().setFromBufferAttribute(new THREE.BufferAttribute(fd.tri, 3));
+  const f = fitParams(tab, box, n);
+  const target = d.normal ? fd.centroid.clone() : ent.point.clone();
+  const dist = f.pos.distanceTo(f.target);
+  syncCameraAspect(tab);
+  animateCamera(tab, target.clone().addScaledVector(n, dist), target, f.zoom, 300, up);
+}
+
+// ---- DXF export of a planar face: its outline seen from the front of the face, as LINE / ARC / CIRCLE
+const DXF_UNITS = {
+  mm: { s: 1, code: 4, metric: 1 }, cm: { s: 0.1, code: 5, metric: 1 }, m: { s: 0.001, code: 6, metric: 1 },
+  um: { s: 1000, code: 13, metric: 1 }, in: { s: 1 / 25.4, code: 1, metric: 0 }, ft: { s: 1 / 304.8, code: 2, metric: 0 },
+};
+/** 2D frame of a face plane: screen-right U and screen-up V when looking at the face along -n (U x V = n);
+ *  V follows world Z (or Y for horizontal faces), like the standard views */
+function faceFrame(n) {
+  const up = Math.abs(n.z) < 0.9 ? Z_UP.clone() : new THREE.Vector3(0, 1, 0);
+  const V = up.addScaledVector(n, -up.dot(n)).normalize();
+  const U = new THREE.Vector3().crossVectors(V, n).normalize();
+  return { U, V, n };
+}
+function faceOutline(tab, ent) {
+  const part = ent.part, d = describeEntity(tab, ent);
+  if (!d.normal) return null;
+  const fd = faceData(part, ent.f);
+  const g = part.mesh.geometry, pos = g.getAttribute('position').array, idx = g.getIndex().array;
+  // weld by position (faces can repeat vertices), then boundary = directed edges used once
+  const q = 1 / (tab.diag * 1e-7);
+  const ids = new Map(), P = [];
+  const vid = (i) => {
+    const k = `${Math.round(pos[i * 3] * q)},${Math.round(pos[i * 3 + 1] * q)},${Math.round(pos[i * 3 + 2] * q)}`;
+    let v = ids.get(k);
+    if (v === undefined) { v = P.length; ids.set(k, v); P.push(new THREE.Vector3().fromArray(pos, i * 3)); }
+    return v;
+  };
+  const und = new Map(), dir = [];
+  for (let t = fd.first; t <= fd.last; t++) {
+    const v = [vid(idx[t * 3]), vid(idx[t * 3 + 1]), vid(idx[t * 3 + 2])];
+    for (let e = 0; e < 3; e++) {
+      const a = v[e], b = v[(e + 1) % 3];
+      if (a === b) continue;
+      const k = a < b ? `${a}_${b}` : `${b}_${a}`;
+      und.set(k, (und.get(k) || 0) + 1);
+      dir.push([a, b, k]);
+    }
+  }
+  const next = new Map();
+  for (const [a, b, k] of dir) if (und.get(k) === 1) { let l = next.get(a); if (!l) next.set(a, (l = [])); l.push(b); }
+  const loops = [];
+  const used = new Set();
+  for (const [start, outs] of next) {
+    for (const first of outs) {
+      if (used.has(`${start}>${first}`)) continue;
+      const loop = [start];
+      let a = start, b = first;
+      for (let guard = 0; guard < 1e6; guard++) {
+        used.add(`${a}>${b}`);
+        if (b === start) break;
+        loop.push(b);
+        const cand = (next.get(b) || []).filter((c) => !used.has(`${b}>${c}`));
+        if (!cand.length) break;
+        a = b; b = cand[0];
+      }
+      if (loop.length >= 2) loops.push(loop);
+    }
+  }
+  if (!loops.length) return null;
+  // CAD vertices (where the part's edges branch) split a loop into its CAD edges
+  const adj = partAdj(tab, part);
+  const qa = 1 / (tab.diag * 1e-6);
+  const isCadVertex = (p) => { const l = adj.get(`${Math.round(p.x * qa)},${Math.round(p.y * qa)},${Math.round(p.z * qa)}`); return !!l && l.length !== 2; };
+  const fr = faceFrame(d.normal);
+  const to2 = (p) => [p.dot(fr.U), p.dot(fr.V)];
+  const out = { frame: fr, loops: [], ents: [], counts: { line: 0, arc: 0, circle: 0 } };
+  for (const loop of loops) {
+    const p3 = loop.map((i) => P[i]), p2 = p3.map(to2), n = p2.length;
+    const corner = p3.map((p, i) => {
+      if (isCadVertex(p)) return true;
+      const a = p2[(i - 1 + n) % n], b = p2[i], c = p2[(i + 1) % n];
+      const ux = b[0] - a[0], uy = b[1] - a[1], wx = c[0] - b[0], wy = c[1] - b[1];
+      const cos = (ux * wx + uy * wy) / (Math.hypot(ux, uy) * Math.hypot(wx, wy) || 1);
+      return cos < Math.cos(THREE.MathUtils.degToRad(50)); // sharp corner even without a CAD vertex
+    });
+    out.loops.push(p2);
+    const starts = [];
+    corner.forEach((c, i) => { if (c) starts.push(i); });
+    if (!starts.length) { // smooth closed loop: a circle, or a closed polyline
+      const c = fitCircle2(p2);
+      if (c) { out.ents.push({ t: 'circle', c: [c.x, c.y], r: c.r }); out.counts.circle++; }
+      else { for (let i = 0; i < n; i++) out.ents.push({ t: 'line', a: p2[i], b: p2[(i + 1) % n] }); out.counts.line += n; }
+      continue;
+    }
+    for (let s = 0; s < starts.length; s++) {
+      const i0 = starts[s], i1 = starts[(s + 1) % starts.length];
+      const piece = [];
+      for (let i = i0; ; i = (i + 1) % n) { piece.push(p2[i]); if (i === i1 && piece.length > 1) break; if (piece.length > n + 1) break; }
+      addPiece(out, piece);
+    }
+  }
+  return out;
+}
+function fitCircle2(pts) {
+  if (pts.length < 3) return null;
+  const a = pts[0], b = pts[Math.floor(pts.length / 3)], c = pts[Math.floor((2 * pts.length) / 3)];
+  const d = 2 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
+  if (Math.abs(d) < 1e-12) return null;
+  const s = (p) => p[0] * p[0] + p[1] * p[1];
+  const x = (s(a) * (b[1] - c[1]) + s(b) * (c[1] - a[1]) + s(c) * (a[1] - b[1])) / d;
+  const y = (s(a) * (c[0] - b[0]) + s(b) * (a[0] - c[0]) + s(c) * (b[0] - a[0])) / d;
+  const r = Math.hypot(a[0] - x, a[1] - y);
+  const tol = Math.max(2e-3, r * 5e-4);
+  for (const p of pts) if (Math.abs(Math.hypot(p[0] - x, p[1] - y) - r) > tol) return null;
+  return { x, y, r };
+}
+function addPiece(out, pts) {
+  const a = pts[0], b = pts[pts.length - 1];
+  const chord = Math.hypot(b[0] - a[0], b[1] - a[1]);
+  let straight = true;
+  if (pts.length > 2) {
+    const tol = Math.max(1e-3, chord * 1e-5);
+    for (const p of pts) {
+      const dd = chord > 0 ? Math.abs((b[0] - a[0]) * (a[1] - p[1]) - (a[0] - p[0]) * (b[1] - a[1])) / chord : Math.hypot(p[0] - a[0], p[1] - a[1]);
+      if (dd > tol) { straight = false; break; }
+    }
+  }
+  if (straight) { out.ents.push({ t: 'line', a, b }); out.counts.line++; return; }
+  const c = fitCircle2(pts);
+  const closed = pts.length > 3 && Math.hypot(b[0] - a[0], b[1] - a[1]) <= Math.max(1e-6, (c ? c.r : chord) * 1e-6);
+  if (c && closed) { out.ents.push({ t: 'circle', c: [c.x, c.y], r: c.r }); out.counts.circle++; return; }
+  if (c) {
+    // sweep direction from the turning of the points
+    let sweep = 0;
+    for (let i = 1; i < pts.length; i++) {
+      const u = [pts[i - 1][0] - c.x, pts[i - 1][1] - c.y], w = [pts[i][0] - c.x, pts[i][1] - c.y];
+      sweep += Math.atan2(u[0] * w[1] - u[1] * w[0], u[0] * w[0] + u[1] * w[1]);
+    }
+    const ang = (p) => THREE.MathUtils.radToDeg(Math.atan2(p[1] - c.y, p[0] - c.x));
+    const s0 = sweep > 0 ? ang(a) : ang(b), s1 = sweep > 0 ? ang(b) : ang(a);
+    out.ents.push({ t: 'arc', c: [c.x, c.y], r: c.r, a0: s0, a1: s1 }); out.counts.arc++;
+    return;
+  }
+  for (let i = 1; i < pts.length; i++) out.ents.push({ t: 'line', a: pts[i - 1], b: pts[i] });
+  out.counts.line += pts.length - 1;
+}
+function dxfText(outline, unitKey) {
+  const u = DXF_UNITS[unitKey] || DXF_UNITS.mm;
+  const num = (x) => { const v = Number((x * u.s).toFixed(6)); return String(Object.is(v, -0) ? 0 : v); };
+  const ang = (x) => { let v = x % 360; if (v < 0) v += 360; return String(Number(v.toFixed(6))); };
+  const L = [];
+  const g = (code, val) => { L.push(String(code), String(val)); };
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const lp of outline.loops) for (const [x, y] of lp) { minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); }
+  g(0, 'SECTION'); g(2, 'HEADER');
+  g(9, '$ACADVER'); g(1, 'AC1009');
+  g(9, '$INSUNITS'); g(70, u.code);
+  g(9, '$MEASUREMENT'); g(70, u.metric);
+  g(9, '$EXTMIN'); g(10, num(minX)); g(20, num(minY)); g(30, 0);
+  g(9, '$EXTMAX'); g(10, num(maxX)); g(20, num(maxY)); g(30, 0);
+  g(0, 'ENDSEC');
+  g(0, 'SECTION'); g(2, 'ENTITIES');
+  for (const e of outline.ents) {
+    if (e.t === 'line') { g(0, 'LINE'); g(8, '0'); g(10, num(e.a[0])); g(20, num(e.a[1])); g(30, 0); g(11, num(e.b[0])); g(21, num(e.b[1])); g(31, 0); }
+    else if (e.t === 'circle') { g(0, 'CIRCLE'); g(8, '0'); g(10, num(e.c[0])); g(20, num(e.c[1])); g(30, 0); g(40, num(e.r)); }
+    else { g(0, 'ARC'); g(8, '0'); g(10, num(e.c[0])); g(20, num(e.c[1])); g(30, 0); g(40, num(e.r)); g(50, ang(e.a0)); g(51, ang(e.a1)); }
+  }
+  g(0, 'ENDSEC'); g(0, 'EOF');
+  return L.join('\r\n') + '\r\n';
+}
+
+let dxfJob = null;
+const saveFetch = (u, o = {}) => fetch(u, { cache: 'no-store', ...o, headers: { 'X-StepViewer': '1', 'Content-Type': 'application/json', ...(o.headers || {}) } });
+const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* ignore */ } };
+function dxfMsg(text, kind = '') { const m = $('dxfMsg'); m.textContent = text; m.classList.toggle('err', kind === 'err'); m.classList.toggle('ok', kind === 'ok'); }
+async function openDxfDialog(tab, ent) {
+  const outline = faceOutline(tab, ent);
+  if (!outline) { toast('평면이 아닌 면은 DXF로 내보낼 수 없습니다.', true); return; }
+  dxfJob = { tab, ent, outline };
+  const c = outline.counts;
+  $('dxfInfo').innerHTML = `${escapeHtml(ent.part.name)} · 면 #${ent.f + 1} · 윤곽 ${outline.loops.length}개<br>직선 ${c.line} · 호 ${c.arc} · 원 ${c.circle} — 면 바깥쪽에서 수직으로 본 모양`;
+  const base = (ent.part.name || tab.name || 'face').replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'face';
+  $('dxfName').value = `${base}_면${ent.f + 1}.dxf`;
+  $('dxfUnit').value = lsGet('sv.dxfUnit') || 'mm';
+  $('dxfDirRow').classList.toggle('hidden', !LOCAL_SERVER);
+  $('dxfWebNote').classList.toggle('hidden', LOCAL_SERVER);
+  dxfMsg('');
+  $('btnDxfCreate').disabled = false;
+  $('dxfDlg').classList.remove('hidden');
+  if (LOCAL_SERVER) {
+    let dir = tab.srcDir || lsGet('sv.dxfDir') || '';
+    if (!dir) { try { dir = (await (await saveFetch('/api/save/defaults')).json()).dir || ''; } catch { /* ignore */ } }
+    $('dxfDir').value = dir;
+  }
+  $('dxfName').focus();
+  $('dxfName').setSelectionRange(0, Math.max(0, $('dxfName').value.length - 4));
+}
+function closeDxfDialog() { $('dxfDlg').classList.add('hidden'); dxfJob = null; }
+async function createDxf() {
+  if (!dxfJob) return;
+  let name = $('dxfName').value.trim();
+  if (!name) { dxfMsg('파일 이름을 입력하세요.', 'err'); return; }
+  if (!/\.dxf$/i.test(name)) name += '.dxf';
+  if (/[\\/:*?"<>|]/.test(name)) { dxfMsg('파일 이름에 \\ / : * ? " < > | 는 쓸 수 없습니다.', 'err'); return; }
+  const unit = $('dxfUnit').value;
+  lsSet('sv.dxfUnit', unit);
+  const content = dxfText(dxfJob.outline, unit);
+  if (!LOCAL_SERVER) { // web: the browser's save dialog or a download
+    try {
+      if (window.showSaveFilePicker) {
+        const h = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: 'DXF', accept: { 'application/dxf': ['.dxf'] } }] });
+        const w = await h.createWritable(); await w.write(content); await w.close();
+      } else {
+        const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob([content], { type: 'application/dxf' })), download: name });
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      }
+      closeDxfDialog();
+      toast(`DXF를 저장했습니다: ${name}`);
+    } catch (e) { if (e && e.name !== 'AbortError') dxfMsg(`저장하지 못했습니다: ${e.message || e}`, 'err'); }
+    return;
+  }
+  const dir = $('dxfDir').value.trim();
+  if (!dir) { dxfMsg('저장 폴더를 입력하거나 찾아보기로 고르세요.', 'err'); return; }
+  $('btnDxfCreate').disabled = true;
+  try {
+    const send = async (overwrite) => (await saveFetch('/api/save/file', { method: 'POST', body: JSON.stringify({ dir, name, content, overwrite }) })).json();
+    let r = await send(false);
+    if (r.exists && window.confirm(`${name} 파일이 이미 있습니다. 덮어쓸까요?`)) r = await send(true);
+    if (r.ok) {
+      lsSet('sv.dxfDir', dir);
+      if (dxfJob) dxfJob.tab.srcDir = dir;
+      closeDxfDialog();
+      toast(`DXF를 저장했습니다: ${r.path}`);
+    } else dxfMsg(r.exists ? '저장을 취소했습니다.' : r.error || '저장하지 못했습니다.', 'err');
+  } catch (e) {
+    dxfMsg(`저장하지 못했습니다: ${e.message || e}`, 'err');
+  } finally { $('btnDxfCreate').disabled = false; }
+}
+$('btnDxfCreate').onclick = createDxf;
+$('btnDxfClose').onclick = closeDxfDialog;
+$('dxfName').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); createDxf(); } });
+$('btnDxfBrowse').onclick = async () => {
+  $('btnDxfBrowse').disabled = true;
+  dxfMsg('폴더 선택 창을 여는 중…');
+  try {
+    const r = await (await saveFetch('/api/save/pick-folder', { method: 'POST', body: JSON.stringify({ initial: $('dxfDir').value.trim() }) })).json();
+    if (r.path) $('dxfDir').value = r.path;
+    dxfMsg('');
+  } catch (e) { dxfMsg(`폴더 선택 창을 열지 못했습니다: ${e.message || e}`, 'err'); }
+  finally { $('btnDxfBrowse').disabled = false; }
+};
+
 // ---------------------------------------------------------------- section
 function initSection(tab) {
   const b = tab.box;
@@ -1612,12 +2280,14 @@ function selectParts(list, additive = false) {
   for (const p of changed) applyPart(tab, p);
   updateTreeStates();
   updateProps();
+  pruneEntities(tab);
   requestRender();
 }
 
 function setVisible(tab, list, vis) {
   for (const p of list) p.visible = vis;
   refreshParts(tab, list);
+  pruneEntities(tab);
   updateTreeStates();
   updateStatus();
 }
@@ -1660,6 +2330,9 @@ function openContextMenu(x, y, onTarget = true) {
   ctxMenu.querySelector('[data-act="hide"]').disabled = !sel;
   ctxMenu.querySelector('[data-act="hideOthers"]').disabled = !sel || tab.parts.every((p) => tab.selection.has(p) || !p.visible);
   ctxMenu.querySelector('[data-act="showAll"]').disabled = tab.parts.every((p) => p.visible);
+  const face = actionFace(tab);
+  ctxMenu.querySelector('[data-act="normalView"]').disabled = !face;
+  ctxMenu.querySelector('[data-act="exportDxf"]').disabled = !face || !describeEntity(tab, face).normal;
   ctxMenu.classList.remove('hidden');
   const r = ctxMenu.getBoundingClientRect();
   ctxMenu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - r.width - 4))}px`;
@@ -1673,6 +2346,8 @@ ctxMenu.addEventListener('click', (e) => {
   if (b.dataset.act === 'hide') hideSelected();
   else if (b.dataset.act === 'hideOthers') hideOthers();
   else if (b.dataset.act === 'showAll') showAll();
+  else if (b.dataset.act === 'normalView') { const f = actionFace(active); if (f) viewNormalTo(active, f); }
+  else if (b.dataset.act === 'exportDxf') { const f = actionFace(active); if (f) openDxfDialog(active, f); }
   requestRender();
 });
 ctxMenu.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -1928,6 +2603,7 @@ canvas.addEventListener('pointermove', (e) => {
 canvas.addEventListener('pointerleave', () => {
   hoverQueued = null;
   if (active?.hover) { const h = active.hover; active.hover = null; applyPart(active, h); requestRender(); }
+  if (active) setEntityHover(active, null);
   snapObj.visible = false;
   $('stCursor').textContent = '';
 });
@@ -1958,7 +2634,9 @@ function processHover() {
     }
     canvas.title = p ? p.name : '';
     canvas.style.cursor = sectionHandleAt(e, hit) ? 'move' : '';
+    setEntityHover(tab, hit && tab.selection.has(hit.part) ? entityFromHit(tab, hit, e) : null);
   } else {
+    setEntityHover(tab, null);
     if (mode === 'distance' || mode === 'angle' || mode === 'radius') hit = snapHit(hit, e);
     if (hit) {
       snapObj.position.copy(hit.point);
@@ -1978,6 +2656,10 @@ function onRightClick(e) {
   if (tab.pending) { cancelPending(); return; } // right click also aborts an unfinished measurement
   const hit = pick(e);
   if (hit && !tab.selection.has(hit.part)) { selectParts([hit.part]); revealPart(tab, hit.part); }
+  else if (hit && !hit.cap && mode === 'select' && !actionFace(tab)) {
+    const f = brepFaceOf(hit.part, hit.tri);
+    if (f >= 0) clickEntity(tab, { kind: 'face', part: hit.part, f, point: hit.point.clone(), viewNormal: hit.normal.clone(), key: `${hit.part.id}:f:${f}` });
+  }
   openContextMenu(e.clientX, e.clientY, !!hit);
 }
 
@@ -1986,6 +2668,10 @@ function onClick(e) {
   if (!tab || tab.loading) return;
   let hit = pick(e);
   if (mode === 'select') {
+    if (hit && !hit.cap && tab.selection.has(hit.part) && !(e.ctrlKey || e.metaKey)) {
+      const ent = entityFromHit(tab, hit, e);
+      if (ent) { clickEntity(tab, ent); setEntityHover(tab, null); return; }
+    }
     if (hit) { selectParts([hit.part], e.ctrlKey || e.metaKey); revealPart(tab, hit.part); }
     else if (!e.ctrlKey) selectParts([]);
     return;
@@ -2016,6 +2702,7 @@ function onClick(e) {
 
 // ---------------------------------------------------------------- keyboard
 window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('dxfDlg').classList.contains('hidden')) { e.preventDefault(); closeDxfDialog(); return; }
   if (e.target.tagName === 'INPUT' && e.target.type !== 'range' && e.target.type !== 'checkbox' && e.target.type !== 'color' || e.target.tagName === 'SELECT') return;
   const k = e.key.toLowerCase();
   if (e.ctrlKey && k === 'o') { e.preventDefault(); $('fileInput').click(); return; }
@@ -2030,7 +2717,9 @@ window.addEventListener('keydown', (e) => {
     if (!ctxMenu.classList.contains('hidden')) { closeContextMenu(); return; }
     if (!$('help').classList.contains('hidden')) { $('help').classList.add('hidden'); return; }
     if (!$('updateDlg').classList.contains('hidden')) { if (!updBusy) $('updateDlg').classList.add('hidden'); return; }
+    if (!$('dxfDlg').classList.contains('hidden')) { closeDxfDialog(); return; }
     if (active?.pending) cancelPending();
+    else if (active?.entities?.length) setEntities(active, []);
     else if (mode !== 'select') setMode('select');
     else selectParts([]);
     return;
@@ -2064,6 +2753,7 @@ window.addEventListener('keydown', (e) => {
       if (!e.shiftKey) return;
       cancelPending();
       clearMeasures(active);
+      if (active.entities) setEntities(active, []);
       selectParts([]);
       break;
     case 'delete': case 'backspace':
@@ -2207,7 +2897,8 @@ function connectServer() {
   });
   es.addEventListener('openfiles', (ev) => {
     for (const f of JSON.parse(ev.data)) {
-      loadBuffer(f.name, async () => {
+      loadBuffer(f.name, async (tab) => {
+        if (f.dir) tab.srcDir = f.dir;
         const r = await fetch(`/api/file/${f.id}`);
         if (!r.ok) throw new Error(`파일을 읽을 수 없습니다 (${r.status})`);
         return r.arrayBuffer();
@@ -2400,6 +3091,7 @@ window.__sv = {
     return tab;
   },
   snapHit, applySection, sectionHandleAt, fitCylinderFace, workerAssetsReady,
+  faceData, describeEntity, setEntities, viewNormalTo, faceOutline, dxfText, openDxfDialog, actionFace, closestBetween, faceFrame, measurePair,
   get persistentGeometries() { let n = 0; originScene.traverse((o) => { if (o.geometry) n++; }); return n; },
   get tabs() { return tabs; }, get active() { return active; }, THREE, renderer, controls, setView, setMode, selectParts, pick, pool,
   loadUrl: (url, name) => loadBuffer(name || url.split('/').pop(), async () => (await fetch(url)).arrayBuffer(), 0),

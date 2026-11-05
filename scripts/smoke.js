@@ -15,6 +15,48 @@ const SHOTS = process.env.SV_SHOTS || null;
 const fails = [];
 const check = (cond, msg, extra = '') => { console.log(`${cond ? 'PASS' : 'FAIL'}  ${msg}${extra ? '  ' + extra : ''}`); if (!cond) fails.push(msg); };
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+/** DXF LINE/ARC/CIRCLE -> closed loops; area = largest loop minus the others (outline with holes) */
+function dxfLoops(text, scale = 1) {
+  const t = text.split(/\r?\n/), ents = [];
+  let cur = null, inEnt = false;
+  for (let i = 0; i + 1 < t.length; i += 2) {
+    const code = t[i].trim(), val = t[i + 1].trim();
+    if (code === '2' && val === 'ENTITIES') inEnt = true;
+    if (!inEnt) continue;
+    if (code === '0') { if (cur) ents.push(cur); cur = ['LINE', 'ARC', 'CIRCLE'].includes(val) ? { t: val } : null; } else if (cur) cur[code] = Number(val);
+  }
+  const circles = [], open = [];
+  for (const e of ents) {
+    if (e.t === 'CIRCLE') { circles.push(Math.PI * e[40] * e[40]); continue; }
+    if (e.t === 'LINE') { open.push([[e[10], e[20]], [e[11], e[21]]]); continue; }
+    let a0 = (e[50] * Math.PI) / 180, a1 = (e[51] * Math.PI) / 180;
+    if (a1 <= a0) a1 += 2 * Math.PI;
+    const pts = [];
+    for (let k = 0; k <= 64; k++) { const a = a0 + ((a1 - a0) * k) / 64; pts.push([e[10] + e[40] * Math.cos(a), e[20] + e[40] * Math.sin(a)]); }
+    open.push(pts);
+  }
+  const near = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]) < 1e-3 * scale;
+  const used = open.map(() => false), areas = [];
+  let openLoops = 0;
+  for (let i = 0; i < open.length; i++) {
+    if (used[i]) continue;
+    used[i] = true;
+    const loop = open[i].slice();
+    for (;;) {
+      const end = loop[loop.length - 1];
+      if (loop.length > 2 && near(end, loop[0])) break;
+      const j = open.findIndex((p, k) => !used[k] && (near(p[0], end) || near(p[p.length - 1], end)));
+      if (j < 0) { openLoops++; break; }
+      used[j] = true;
+      loop.push(...(near(open[j][0], end) ? open[j] : open[j].slice().reverse()).slice(1));
+    }
+    let a = 0;
+    for (let k = 0; k < loop.length; k++) { const p = loop[k], q = loop[(k + 1) % loop.length]; a += p[0] * q[1] - q[0] * p[1]; }
+    areas.push(Math.abs(a / 2));
+  }
+  const all = [...areas, ...circles].sort((x, y) => y - x);
+  return { loops: areas.length, circles: circles.length, openLoops, area: all.length ? all[0] - all.slice(1).reduce((s, x) => s + x, 0) : 0 };
+}
 
 (async () => {
   let files = process.argv.slice(2).map((f) => path.resolve(f));
@@ -367,6 +409,185 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     check(synth.planeFit === null, 'a planar face is not taken for a cylinder');
     check(synth.coneFit === null, 'a very flat cone (0.57°) is not taken for a cylinder');
     await shot('6-synthetic');
+
+    // ---- Parasolid X_T + face/edge/vertex picking, pair measurement, normal view, DXF export
+    const xtFile = path.join(root, 'testfiles', 'xt', 'lens mount_261022 - Part 1.x_t');
+    if (fs.existsSync(xtFile)) {
+      const nT = await ev(() => window.__sv.tabs.length);
+      await (await page.$('#fileInput')).uploadFile(xtFile);
+      await page.waitForFunction((n) => window.__sv.tabs.length > n && !window.__sv.tabs.some((t) => t.loading), { timeout: 300000 }, nT);
+      const xt = await ev(() => { const t = window.__sv.active; return { parts: t.parts.length, tris: t.triCount, name: t.parts[0] && t.parts[0].name, rgb: t.parts[0] && t.parts[0].rgb }; });
+      check(xt.parts === 1 && xt.tris > 1000 && xt.name === 'Part 1' && Math.abs(xt.rgb[0] - 0.502) < 0.01, 'X_T part opens with the name and color stored in the file', JSON.stringify(xt));
+      await ev(() => window.__sv.setView(window.__sv.active, 'iso', false)); await wait(300);
+      // two planar faces, picked well inside (the same face 12 px around the point)
+      const fp = await ev(() => {
+        const sv = window.__sv, c = document.getElementById('canvas').getBoundingClientRect(), out = [], seen = new Set();
+        const faceAt = (x, y) => { const h = sv.pick({ clientX: x, clientY: y }); if (!h || h.cap) return -1; const ff = h.part.faceFirst, fl = h.part.faceLast; for (let i = 0; i < ff.length; i++) if (h.tri >= ff[i] && h.tri <= fl[i]) return i; return -1; };
+        for (let y = 0.25; y <= 0.75; y += 0.01) for (let x = 0.25; x <= 0.75; x += 0.01) {
+          const X = c.left + c.width * x, Y = c.top + c.height * y, f = faceAt(X, Y);
+          if (f < 0 || seen.has(f) || [[12, 0], [-12, 0], [0, 12], [0, -12]].some(([dx, dy]) => faceAt(X + dx, Y + dy) !== f)) continue;
+          if (!sv.faceData(sv.active.parts[0], f).planar) continue;
+          seen.add(f); out.push({ x: X, y: Y, f });
+        }
+        // a pair of faces that do not touch, so the distance is a real test
+        const box = (f) => new sv.THREE.Box3().setFromBufferAttribute(new sv.THREE.BufferAttribute(sv.faceData(sv.active.parts[0], f).tri, 3));
+        for (let i = 0; i < out.length; i++) for (let j = i + 1; j < out.length; j++) {
+          const a = box(out[i].f), b = box(out[j].f);
+          const gap = Math.max(a.min.x - b.max.x, b.min.x - a.max.x, a.min.y - b.max.y, b.min.y - a.max.y, a.min.z - b.max.z, b.min.z - a.max.z);
+          if (gap > 0.5) return [out[i], out[j]];
+        }
+        return out.slice(0, 2);
+      });
+      check(fp.length === 2, 'found two planar faces to pick', JSON.stringify(fp));
+      if (fp.length === 2) {
+        await page.mouse.click(fp[0].x, fp[0].y); await wait(80); // selects the part
+        const selOnly = await ev(() => ({ sel: window.__sv.active.selection.size, ents: (window.__sv.active.entities || []).length }));
+        await page.mouse.click(fp[0].x, fp[0].y); await wait(80); // second click: the face
+        await page.mouse.click(fp[1].x, fp[1].y); await wait(150);
+        const pair = await ev(() => {
+          const sv = window.__sv, t = sv.active, [A, B] = t.entities;
+          // brute force reference: every vertex of one face to every triangle of the other, both ways
+          const T = new sv.THREE.Triangle(), q = new sv.THREE.Vector3(), p = new sv.THREE.Vector3();
+          const fa = sv.faceData(A.part, A.f), fb = sv.faceData(B.part, B.f);
+          let ref = Infinity;
+          for (const [x, y] of [[fa, fb], [fb, fa]]) for (let i = 0; i < x.tri.length; i += 3) {
+            p.fromArray(x.tri, i);
+            for (let j = 0; j < y.tri.length; j += 9) { T.a.fromArray(y.tri, j); T.b.fromArray(y.tri, j + 3); T.c.fromArray(y.tri, j + 6); T.closestPointToPoint(p, q); ref = Math.min(ref, q.distanceTo(p)); }
+          }
+          return { kinds: t.entities.map((e) => e.kind), d: sv.closestBetween(A, B).d, ref, panel: document.getElementById('entityBody').innerText, visible: !document.getElementById('entityPanel').classList.contains('hidden') };
+        });
+        check(selOnly.sel === 1 && selOnly.ents === 0, 'first click selects the part only', JSON.stringify(selOnly));
+        check(pair.visible && pair.kinds.join() === 'face,face' && /최단 거리/.test(pair.panel) && /면적/.test(pair.panel), 'second click picks a face, another face is measured against it', pair.kinds.join());
+        check(pair.d <= pair.ref + 1e-6 && pair.ref - pair.d < 1e-3 + pair.ref * 1e-3, 'face-to-face distance matches a brute-force reference', `${pair.d.toFixed(5)} vs ${pair.ref.toFixed(5)}`);
+        // many face pairs (and face-edge / edge-edge / vertex pairs) against brute force
+        const many = await ev(() => {
+          const sv = window.__sv, t = sv.active, part = t.parts[0], V = sv.THREE.Vector3;
+          const T = new sv.THREE.Triangle(), q = new V(), p = new V(), c1 = new V(), c2 = new V();
+          const faces = [];
+          for (let f = 0; f < part.faceFirst.length && faces.length < 14; f++) faces.push({ kind: 'face', part, f, key: 'f' + f, viewNormal: new V(0, 0, 1), point: new V() });
+          const ptTri = (pt, fd) => { let m = Infinity; for (let j = 0; j < fd.tri.length; j += 9) { T.a.fromArray(fd.tri, j); T.b.fromArray(fd.tri, j + 3); T.c.fromArray(fd.tri, j + 6); T.closestPointToPoint(pt, q); m = Math.min(m, q.distanceTo(pt)); } return m; };
+          let worst = 0, pairs = 0, positive = 0;
+          for (let i = 0; i < faces.length; i++) for (let j = i + 1; j < faces.length; j++) {
+            const fa = sv.faceData(part, faces[i].f), fb = sv.faceData(part, faces[j].f);
+            let ref = Infinity;
+            for (const [x, y] of [[fa, fb], [fb, fa]]) for (let k = 0; k < x.tri.length; k += 3) ref = Math.min(ref, ptTri(p.fromArray(x.tri, k), y));
+            const d = sv.closestBetween(faces[i], faces[j]).d;
+            // the reference only samples vertices, so the exact result may be smaller, never larger
+            worst = Math.max(worst, d - ref, ref > 0 ? Math.min(ref - d, 0) : 0);
+            if (d > ref + 1e-6) worst = Math.max(worst, d - ref);
+            pairs++; if (ref > 0.01) positive++;
+          }
+          // an edge (polyline) of the part against a face: compare with dense sampling of the edge
+          const e = part.edges, pts = [new V(e[0], e[1], e[2]), new V(e[3], e[4], e[5])];
+          const edge = { kind: 'edge', part, pts, closed: false, key: 'e0' };
+          let edgeWorst = 0;
+          for (const fc of faces.slice(0, 6)) {
+            const fd = sv.faceData(part, fc.f);
+            let ref = Infinity;
+            for (let k = 0; k <= 400; k++) ref = Math.min(ref, ptTri(c1.lerpVectors(pts[0], pts[1], k / 400), fd));
+            edgeWorst = Math.max(edgeWorst, Math.abs(sv.closestBetween(edge, fc).d - ref));
+          }
+          const vtx = { kind: 'vertex', part, point: pts[0].clone(), key: 'v0' };
+          const vErr = Math.abs(sv.closestBetween(vtx, faces[0]).d - ptTri(pts[0], sv.faceData(part, faces[0].f)));
+          return { pairs, positive, worst, edgeWorst, vErr };
+        });
+        check(many.pairs > 20 && many.positive > 5 && many.worst < 1e-4 && many.edgeWorst < 2e-3 && many.vErr < 1e-6,
+          'closest distance face-face / edge-face / vertex-face agrees with brute force', JSON.stringify(many));
+        await page.mouse.click(fp[1].x, fp[1].y); await wait(80);
+        check((await ev(() => window.__sv.active.entities.length)) === 1, 'clicking a picked face again releases it');
+        // right click on the picked face: normal view + DXF
+        await rclick(fp[0].x, fp[0].y);
+        const fm = await ev(() => ({ open: !document.getElementById('ctxMenu').classList.contains('hidden'), nv: !document.querySelector('[data-act=normalView]').disabled, dxf: !document.querySelector('[data-act=exportDxf]').disabled }));
+        check(fm.open && fm.nv && fm.dxf, 'right click on a picked plane offers normal view and DXF export', JSON.stringify(fm));
+        await menuItem('normalView'); await wait(500);
+        const nd = await ev(() => { const sv = window.__sv, t = sv.active, f = sv.actionFace(t); return t.camera.getWorldDirection(new sv.THREE.Vector3()).dot(sv.describeEntity(t, f).normal); });
+        check(nd < -0.99999, 'normal view looks straight at the face', nd.toFixed(6));
+        const dxfDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sv-dxf-'));
+        await rclick(fp[0].x, fp[0].y);
+        await menuItem('exportDxf');
+        await page.waitForFunction(() => !document.getElementById('dxfDlg').classList.contains('hidden'));
+        await page.waitForFunction(() => document.getElementById('dxfDir').value !== '', { timeout: 5000 }).catch(() => {});
+        const dlg = await ev(() => ({ unit: document.getElementById('dxfUnit').value, dir: document.getElementById('dxfDir').value, name: document.getElementById('dxfName').value }));
+        check(dlg.unit === 'mm' && dlg.dir && /\.dxf$/.test(dlg.name), 'DXF dialog: mm by default, folder and file name filled in', JSON.stringify(dlg));
+        await ev((d) => { document.getElementById('dxfDir').value = d; document.getElementById('dxfName').value = 'face.dxf'; }, dxfDir);
+        await page.click('#btnDxfCreate');
+        await page.waitForFunction(() => document.getElementById('dxfDlg').classList.contains('hidden'), { timeout: 10000 }).catch(() => {});
+        const dxfPath = path.join(dxfDir, 'face.dxf');
+        const faceArea = await ev(() => { const sv = window.__sv; const f = sv.actionFace(sv.active); return sv.faceData(f.part, f.f).area; });
+        const dx = fs.existsSync(dxfPath) ? dxfLoops(fs.readFileSync(dxfPath, 'utf8')) : null;
+        check(dx && dx.openLoops === 0 && Math.abs(dx.area / faceArea - 1) < 0.005, 'DXF is written: closed outline whose area matches the face', dx ? `${JSON.stringify(dx)} vs face ${faceArea.toFixed(3)}` : 'no file');
+        // the same name again: overwrite after confirmation
+        await rclick(fp[0].x, fp[0].y);
+        await menuItem('exportDxf');
+        await page.waitForFunction(() => !document.getElementById('dxfDlg').classList.contains('hidden'));
+        await ev((d) => { document.getElementById('dxfDir').value = d; document.getElementById('dxfName').value = 'face.dxf'; document.getElementById('dxfUnit').value = 'in'; }, dxfDir);
+        page.once('dialog', (d) => d.accept());
+        await page.click('#btnDxfCreate');
+        await page.waitForFunction(() => document.getElementById('dxfDlg').classList.contains('hidden'), { timeout: 10000 }).catch(() => {});
+        const dxIn = fs.existsSync(dxfPath) ? dxfLoops(fs.readFileSync(dxfPath, 'utf8'), 1 / 25.4) : null;
+        check(dxIn && /\$INSUNITS\r\n70\r\n1\r\n/.test(fs.readFileSync(dxfPath, 'utf8')) && Math.abs(dxIn.area * 25.4 * 25.4 / faceArea - 1) < 0.005, 'an existing file is overwritten after confirmation; inch units scale the outline', dxIn ? dxIn.area.toFixed(4) + ' in²' : 'no file');
+        fs.rmSync(dxfDir, { recursive: true, force: true });
+        await page.keyboard.press('Escape'); await wait(60);
+        const esc1 = await ev(() => ({ ents: window.__sv.active.entities.length, sel: window.__sv.active.selection.size }));
+        await page.keyboard.press('Escape'); await wait(60);
+        const esc2 = await ev(() => window.__sv.active.selection.size);
+        check(esc1.ents === 0 && esc1.sel === 1 && esc2 === 0, 'Escape releases picked faces first, then the selection', JSON.stringify({ ...esc1, then: esc2 }));
+      }
+      await shot('7-xt');
+    } else console.log('SKIP  X_T checks (testfiles/xt/lens mount_261022 - Part 1.x_t not found)');
+
+    // ---- picked-entity math on synthetic faces (no sample files needed)
+    const syn = await ev(() => {
+      const sv = window.__sv, T = sv.THREE, V = T.Vector3, out = {};
+      const mesh = (name, P, I, faces, edges = []) => ({ name, color: [0.7, 0.7, 0.7], position: new Float32Array(P), normal: null, index: new Uint32Array(I), colors: null,
+        edges: new Float32Array(edges), faceFirst: Int32Array.from(faces, (f) => f[0]), faceLast: Int32Array.from(faces, (f) => f[1]) });
+      const load = (name, m) => { const t = sv.loadResult(name, { tree: { name, meshes: [0], children: [] }, meshes: [m] }); sv.selectParts([t.parts[0]]); return t; };
+      const face = (part, f) => ({ kind: 'face', part, f, key: 'f' + f, viewNormal: new V(0, 0, 1), point: new V() });
+      // two planes and two lines 0.5 degrees apart are not parallel
+      const a = (0.5 * Math.PI) / 180, c = Math.cos(a), s = Math.sin(a);
+      const t1 = load('tilt', mesh('tilt', [0, 0, 0, 10, 0, 0, 10, 10, 0, 0, 10, 0, 0, 0, 10, 10, 0, 10, 10, 10 * c, 10 + 10 * s, 0, 10 * c, 10 + 10 * s], [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7], [[0, 1], [2, 3]]));
+      out.planes = sv.measurePair(t1, face(t1.parts[0], 0), face(t1.parts[0], 1)).lines.join(' | ');
+      const line = (p, q, k) => ({ kind: 'edge', part: t1.parts[0], pts: [p, q], closed: false, length: p.distanceTo(q), key: k });
+      out.lines = sv.measurePair(t1, line(new V(0, 0, 0), new V(10, 0, 0), 'l1'), line(new V(0, 0, 5), new V(10 * c, 10 * s, 5), 'l2')).lines.join(' | ');
+      // a long edge above a tiny triangle that lies between any coarse samples: the true minimum is 1
+      const t2 = load('fork', mesh('fork', [436.95, -0.05, 0, 437.05, -0.05, 0, 437, 0.05, 0, 0, 200, -50, 1000, 200, -50, 500, 300, -50], [0, 1, 2, 3, 4, 5], [[0, 1]]));
+      out.edgeFace = sv.closestBetween({ kind: 'edge', part: t2.parts[0], pts: [new V(0, 0, 1), new V(1000, 0, 1)], closed: false, key: 'e' }, face(t2.parts[0], 0)).d;
+      // the same far from the origin (float32 sphere centers rounded the closest triangle away)
+      out.far = [0, 1e6].map((X) => {
+        const pts = [[0, 0], [0, 0.0625], [0.0625, 0.0625], [0.0625, 0.01], [0.125, 0.01], [0.125, 0.125], [-0.0625, 0.125], [-0.0625, 0]];
+        const sh = new T.Shape(); sh.moveTo(...pts[0]); for (const q of pts.slice(1)) sh.lineTo(...q); sh.closePath();
+        const g = new T.ShapeGeometry(sh), Pp = Array.from(g.attributes.position.array);
+        for (let i = 0; i < Pp.length; i += 3) Pp[i] += X;
+        const k = Pp.length / 3; Pp.push(X, 0, 0, X + 0.0625, 0, 0, X, 0.0625, 0);
+        const Ii = Array.from(g.index.array); Ii.push(k, k + 1, k + 2);
+        const tf = load('far' + X, mesh('far', Pp, Ii, [[0, Ii.length / 3 - 1]]));
+        const ea = new V(X + 0.0625, 0, 0.001), eb = new V(X + 0.0625, 0, 0.002);
+        return sv.closestBetween({ kind: 'edge', part: tf.parts[0], pts: [ea, eb], closed: false, key: 'e' }, face(tf.parts[0], 0)).d;
+      });
+      // a disk whose rim has one CAD vertex (an extra edge leaves it): DXF gets a CIRCLE, not a zero-length ARC
+      const P = [0, 0, 0], I = [], E = [], n = 64;
+      for (let i = 0; i < n; i++) { const t = (2 * Math.PI * i) / n; P.push(10 * Math.cos(t), 10 * Math.sin(t), 0); }
+      for (let i = 0; i < n; i++) { I.push(0, 1 + i, 1 + ((i + 1) % n)); E.push(P[3 + i * 3], P[4 + i * 3], 0, P[3 + ((i + 1) % n) * 3], P[4 + ((i + 1) % n) * 3], 0); }
+      E.push(10, 0, 0, 10, 0, -5);
+      const t3 = load('disk', mesh('disk', P, I, [[0, n - 1]], E));
+      const ol = sv.faceOutline(t3, face(t3.parts[0], 0));
+      out.disk = ol ? ol.ents.map((e) => e.t + (e.t === 'arc' ? `(${e.a0.toFixed(1)}..${e.a1.toFixed(1)})` : '')).join(',') : 'none';
+      // edge highlights are clipped by the section like the model
+      sv.setEntities(t3, [{ kind: 'edge', part: t3.parts[0], pts: [new V(10, 0, 0), new V(10, 0, -5)], closed: false, length: 5, key: 'x' }]);
+      out.clip = t3.entGroup.children.filter((o) => o.material && o.material.clippingPlanes === t3.clipPlanes).length;
+      sv.setEntities(t3, [face(t3.parts[0], 0)]);
+      sv.openDxfDialog(t3, face(t3.parts[0], 0));
+      return out;
+    });
+    check(/면 사이 각도 0\.500°|사잇각 0\.500°/.test(syn.planes) && !/평행 평면/.test(syn.planes), 'planes 0.5° apart are not called parallel', syn.planes);
+    check(/직선 사이 각도 0\.500°/.test(syn.lines) && !/평행 직선/.test(syn.lines), 'lines 0.5° apart are not called parallel', syn.lines);
+    check(Math.abs(syn.edgeFace - 1) < 1e-6, 'edge-to-face distance finds a narrow global minimum', String(syn.edgeFace));
+    check(syn.far.every((d) => Math.abs(d - 0.001) < 1e-6), 'edge-to-face distance is the same 1,000,000 mm from the origin', JSON.stringify(syn.far));
+    check(syn.disk === 'circle', 'DXF: a circular outline with one CAD vertex becomes a CIRCLE', syn.disk);
+    check(syn.clip === 1, 'picked edge highlight uses the section clipping planes', String(syn.clip));
+    await page.waitForFunction(() => document.activeElement && document.activeElement.id === 'dxfName', { timeout: 3000 }).catch(() => {});
+    await page.keyboard.press('Escape'); await wait(80);
+    check(await ev(() => document.getElementById('dxfDlg').classList.contains('hidden')), 'Escape closes the DXF dialog while its file name has the focus');
 
     // ---- a new worker must start even when the local server is gone (it is prefetched as blobs)
     await ev(async () => { await window.__sv.workerAssetsReady; for (const w of window.__sv.pool.all.slice()) window.__sv.pool.kill(w); });
