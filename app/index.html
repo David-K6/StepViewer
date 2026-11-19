@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#22262d">
 <title>StepViewer</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 3 28 9.5v13L16 29 4 22.5v-13z' fill='%232f7bff'/%3E%3Cpath d='M16 16 28 9.5M16 16 4 9.5M16 16v13' stroke='%23fff' stroke-width='2' fill='none'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
@@ -16,11 +17,13 @@
 </head>
 <body>
 <header id="topbar">
+  <button id="btnTree" class="btn icon mob-only" title="모델 트리" aria-label="모델 트리">☰</button>
   <div class="brand">STEP<span>Viewer</span></div>
   <button id="btnOpen" class="btn primary" title="파일 열기 (Ctrl+O)">＋ 열기</button>
   <input id="fileInput" type="file" multiple accept=".step,.stp,.iges,.igs,.brep,.brp,.sldprt,.sldasm,.x_t,.xmt_txt" hidden>
   <nav id="tabs"></nav>
   <div class="spacer"></div>
+  <div id="topExtra" class="topbar-extra">
   <label class="qsel" title="테셀레이션 품질 (새로 여는 파일에 적용)">품질
     <select id="quality">
       <option value="draft">빠름</option>
@@ -30,6 +33,8 @@
   </label>
   <button id="btnUpdate" class="btn" title="업데이트 확인">업데이트 확인</button>
   <button id="btnHelp" class="btn icon" title="단축키 (?)">?</button>
+  </div>
+  <button id="btnMore" class="btn icon mob-only" title="더보기" aria-label="더보기">⋮</button>
 </header>
 
 <div id="main">
@@ -60,6 +65,7 @@
     </div>
   </aside>
   <div id="splitter"></div>
+  <div id="drawerBackdrop" class="drawer-backdrop"></div>
 
   <section id="viewport">
     <canvas id="canvas"></canvas>
@@ -142,7 +148,8 @@
 
     <div id="empty" class="empty">
       <div class="drop-icon">⬡</div>
-      <div class="big">STEP 파일을 여기에 끌어다 놓으세요</div>
+      <div class="big desk-only">STEP 파일을 여기에 끌어다 놓으세요</div>
+      <div class="big touch-only">파일 열기를 눌러 CAD 파일을 여세요</div>
       <div class="muted">.step .stp .iges .igs .brep .sldprt .sldasm .x_t · 여러 파일을 동시에 열 수 있습니다</div>
       <button class="btn primary" id="btnOpen2">파일 열기</button>
     </div>
@@ -154,6 +161,7 @@
       <button data-act="hideOthers" role="menuitem">선택 항목 이외 나머지 숨기기</button>
       <div class="sep"></div>
       <button data-act="showAll" role="menuitem">모두 표시<span class="k">Shift+H</span></button>
+      <button data-act="pivot" role="menuitem">여기를 회전 중심으로<span class="k">더블클릭</span></button>
       <div class="sep"></div>
       <button data-act="normalView" role="menuitem">면에 수직으로 보기</button>
       <button data-act="exportDxf" role="menuitem">DXF로 내보내기…</button>
@@ -231,6 +239,14 @@
   <div class="modal-body">
     <h3>조작 방법</h3>
     <table>
+      <tbody class="touch-only">
+      <tr><td>한 손가락 드래그</td><td>회전</td></tr>
+      <tr><td>두 손가락 벌리기·좁히기 / 드래그</td><td>확대·축소 / 이동</td></tr>
+      <tr><td>탭</td><td>부품 선택 (선택한 부품을 다시 탭하면 면·모서리·점 선택, 빈 곳을 탭하면 해제)</td></tr>
+      <tr><td>길게 누르기</td><td>메뉴: 숨기기 / 회전 중심 / 면 수직 보기 / DXF</td></tr>
+      <tr><td>☰ / ⋮</td><td>모델 트리 / 품질·업데이트·도움말</td></tr>
+      </tbody>
+      <tbody class="desk-only">
       <tr><td>왼쪽 드래그</td><td>회전</td></tr>
       <tr><td>오른쪽/가운데 드래그, Shift+왼쪽</td><td>이동(팬)</td></tr>
       <tr><td>오른쪽 클릭 (모델·트리)</td><td>메뉴: 선택 항목 숨기기 / 나머지 숨기기 / 모두 표시 / 면 수직 보기 / DXF</td></tr>
@@ -250,6 +266,7 @@
       <tr><td>Esc</td><td>측정 취소, 면·모서리·점 해제, 선택 해제</td></tr>
       <tr><td>Delete</td><td>마지막 측정 삭제</td></tr>
       <tr><td>Shift+C</td><td>모든 측정과 선택 취소</td></tr>
+      </tbody>
     </table>
     <button class="btn" id="btnHelpClose">닫기</button>
   </div>

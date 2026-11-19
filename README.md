@@ -17,6 +17,7 @@ The same viewer runs in the browser at **https://david-k6.github.io/StepViewer/*
 
 - Open files with the 열기 button, Ctrl+O or drag and drop. For a SolidWorks assembly, select (or drop) the `.SLDASM` together with its part files, because a web page cannot read the files next to it.
 - Not available on the web: opening files by double-click / "Open with", and the in-app updater (the web version is always the latest release). The "데스크톱 앱 받기" button links to the exe.
+- On phones (narrower than 820 px, or landscape under 520 px tall) the layout changes: ☰ opens the model tree as a drawer, ⋮ holds quality / update / help, the tools sit in one scrollable row at the bottom and panels become sheets (tap a sheet's title to fold it). One finger rotates, two fingers zoom and pan, a tap selects (tap a selected part again to pick a face, edge or vertex) and a long press opens the menu (hide, rotation center, normal view, DXF).
 - It is published by `.github/workflows/pages.yml` on every push to `main` that touches the app (or run it by hand from the Actions tab).
 
 ## Features
@@ -76,6 +77,7 @@ npm run swtest -- a.SLDASM --pair p.SLDPRT=p.step   # SolidWorks reader regressi
 npm run xttest -- a.x_t --ref a.step                 # Parasolid reader regression test
 npm run web          # build/web: static web version (what GitHub Pages serves)
 npm run webtest      # headless test of build/web served under /StepViewer/
+npm run mobiletest   # phone/tablet layouts and touch gestures (8 screen sizes, headless Edge)
 ```
 
 Releasing: set `version` in package.json, build, then create a GitHub release whose tag is exactly that version (e.g. `0.0.4`) with the exe attached as `StepViewer.exe`. The in-app updater relies on both. The web version is republished from `main` automatically.

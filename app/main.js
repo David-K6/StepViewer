@@ -1325,6 +1325,7 @@ function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&am
 // A click on an already selected part picks the face, edge or vertex under the cursor (vertex and edge
 // win within a few pixels, like measurement snapping). Two picked entities are measured against each other.
 const ENT_COLOR = 0x19d3ff;
+const TOUCH = window.matchMedia('(pointer: coarse)');
 const entLineMat = new THREE.LineBasicMaterial({ color: ENT_COLOR, depthTest: false, transparent: true });
 const entLineHoverMat = new THREE.LineBasicMaterial({ color: ENT_COLOR, depthTest: false, transparent: true, opacity: 0.55 });
 const entPtMat = new THREE.PointsMaterial({ color: ENT_COLOR, size: 10, sizeAttenuation: false, depthTest: false, transparent: true });
@@ -1670,13 +1671,17 @@ function renderEntityPanel(tab) {
     html += `<div class="ent"><span class="tag">${i + 1} ${KIND[ent.kind]}</span><div class="mv">${describeEntity(tab, ent).lines.join('<br>')}</div></div>`;
   });
   if (tab.entPair) html += `<div class="ent pair"><span class="tag">1↔2</span><div class="mv">${tab.entPair.lines.join('<br>')}</div></div>`;
-  else html += `<div class="hint">${list.length === 1 ? '같은 부품(또는 함께 선택한 부품)의 다른 면·모서리·점을 클릭하면 둘 사이를 측정합니다. 면에서 우클릭하면 수직 보기·DXF 내보내기.' : ''}</div>`;
+  else html += `<div class="hint">${list.length === 1 ? (TOUCH.matches
+    ? '다른 면·모서리·점을 탭하면 둘 사이를 측정합니다. 면을 길게 누르면 수직 보기·DXF 내보내기.'
+    : '같은 부품(또는 함께 선택한 부품)의 다른 면·모서리·점을 클릭하면 둘 사이를 측정합니다. 면에서 우클릭하면 수직 보기·DXF 내보내기.') : ''}</div>`;
   $('entityBody').innerHTML = html;
   $('btnEntPin').disabled = !tab.entPair;
 }
 function setEntities(tab, list) {
   ensureEntityGroups(tab);
   tab.entities = list;
+  $('entityPanel').classList.remove('collapsed'); // a new pick shows its data
+  $('entityPanel').querySelector('.panel-head > span').setAttribute('aria-expanded', 'true');
   renderEntities(tab);
 }
 function clickEntity(tab, ent) {
@@ -1920,8 +1925,10 @@ async function openDxfDialog(tab, ent) {
     if (!dir) { try { dir = (await (await saveFetch('/api/save/defaults')).json()).dir || ''; } catch { /* ignore */ } }
     $('dxfDir').value = dir;
   }
-  $('dxfName').focus();
-  $('dxfName').setSelectionRange(0, Math.max(0, $('dxfName').value.length - 4));
+  if (!TOUCH.matches) { // on phones focusing would pop the keyboard over the dialog
+    $('dxfName').focus();
+    $('dxfName').setSelectionRange(0, Math.max(0, $('dxfName').value.length - 4));
+  }
 }
 function closeDxfDialog() { $('dxfDlg').classList.add('hidden'); dxfJob = null; }
 async function createDxf() {
@@ -2323,13 +2330,16 @@ function hideOthers() {
 // ---- context menu (right click without dragging; right drag still pans)
 const ctxMenu = $('ctxMenu');
 /** @param onTarget false when right-clicking empty space: hide items act on the clicked target only */
-function openContextMenu(x, y, onTarget = true) {
+/** @param point model point under the click (rotation center item); null when the menu is not opened on the model */
+function openContextMenu(x, y, onTarget = true, point = null) {
+  ctxPoint = point;
   const tab = active;
   if (!tab || tab.loading) return;
   const sel = onTarget ? tab.selection.size : 0;
   ctxMenu.querySelector('[data-act="hide"]').disabled = !sel;
   ctxMenu.querySelector('[data-act="hideOthers"]').disabled = !sel || tab.parts.every((p) => tab.selection.has(p) || !p.visible);
   ctxMenu.querySelector('[data-act="showAll"]').disabled = tab.parts.every((p) => p.visible);
+  ctxMenu.querySelector('[data-act="pivot"]').disabled = !onTarget || !ctxPoint;
   const face = actionFace(tab);
   ctxMenu.querySelector('[data-act="normalView"]').disabled = !face;
   ctxMenu.querySelector('[data-act="exportDxf"]').disabled = !face || !describeEntity(tab, face).normal;
@@ -2346,6 +2356,7 @@ ctxMenu.addEventListener('click', (e) => {
   if (b.dataset.act === 'hide') hideSelected();
   else if (b.dataset.act === 'hideOthers') hideOthers();
   else if (b.dataset.act === 'showAll') showAll();
+  else if (b.dataset.act === 'pivot') { if (active && ctxPoint) setPivot(active, ctxPoint); }
   else if (b.dataset.act === 'normalView') { const f = actionFace(active); if (f) viewNormalTo(active, f); }
   else if (b.dataset.act === 'exportDxf') { const f = actionFace(active); if (f) openDxfDialog(active, f); }
   requestRender();
@@ -2579,24 +2590,53 @@ function toast(msg, err = false) {
 }
 
 // ---------------------------------------------------------------- pointer interaction
+// Touch: a tap may wobble a few pixels, a long press is the right click (menu), and a gesture with a
+// second finger (pinch / two-finger pan) is never a tap.
 let down = null;
 let hoverQueued = null;
-canvas.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY, b: e.button, t: performance.now(), max: 0 }; camAnim = null; });
+const TOUCH_SLOP = 10, LONG_PRESS_MS = 550;
+const touchIds = new Set();
+let longPressTimer = null, lastPointerType = 'mouse';
+canvas.addEventListener('pointerdown', (e) => {
+  lastPointerType = e.pointerType;
+  if (e.pointerType === 'touch') {
+    touchIds.add(e.pointerId);
+    if (touchIds.size > 1) { if (down) down.multi = true; clearTimeout(longPressTimer); return; }
+  }
+  down = { id: e.pointerId, x: e.clientX, y: e.clientY, b: e.button, t: performance.now(), max: 0, touch: e.pointerType === 'touch' };
+  camAnim = null;
+  clearTimeout(longPressTimer);
+  if (down.touch) {
+    const d = down;
+    longPressTimer = setTimeout(() => {
+      if (down !== d || d.multi || d.max > TOUCH_SLOP || planeDrag) return;
+      d.long = true;
+      onRightClick({ clientX: d.x, clientY: d.y });
+    }, LONG_PRESS_MS);
+  }
+});
 canvas.addEventListener('pointerup', (e) => {
+  if (e.pointerType === 'touch') touchIds.delete(e.pointerId);
   if (endPlaneDrag(e)) return;
-  if (!down) return;
-  const moved = Math.max(down.max, Math.hypot(e.clientX - down.x, e.clientY - down.y)); // a drag that came back is still a drag
-  const b = down.b;
+  if (!down || e.pointerId !== down.id) return;
+  clearTimeout(longPressTimer);
+  const d = down;
+  const moved = Math.max(d.max, Math.hypot(e.clientX - d.x, e.clientY - d.y)); // a drag that came back is still a drag
   down = null;
-  if (moved > 4) return;
-  if (b === 2) { onRightClick(e); return; }
-  if (b !== 0) return;
+  if (d.multi || d.long) return;
+  if (moved > (d.touch ? TOUCH_SLOP : 4)) return;
+  if (d.b === 2) { onRightClick(e); return; }
+  if (d.b !== 0) return;
   onClick(e);
 });
-canvas.addEventListener('pointercancel', (e) => { endPlaneDrag(e); });
+canvas.addEventListener('pointercancel', (e) => {
+  touchIds.delete(e.pointerId);
+  if (down && e.pointerId === down.id) { clearTimeout(longPressTimer); down = null; }
+  endPlaneDrag(e);
+});
 canvas.addEventListener('pointermove', (e) => {
   if (planeDrag) { if (e.pointerId === planeDrag.id) dragSectionTo(e); return; }
-  if (down) down.max = Math.max(down.max, Math.hypot(e.clientX - down.x, e.clientY - down.y));
+  if (down && e.pointerId === down.id) down.max = Math.max(down.max, Math.hypot(e.clientX - down.x, e.clientY - down.y));
   if (down && (e.buttons & 7)) { if (active?.hover) { const h = active.hover; active.hover = null; applyPart(active, h); } snapObj.visible = false; return; }
   hoverQueued = e;
 });
@@ -2607,13 +2647,16 @@ canvas.addEventListener('pointerleave', () => {
   snapObj.visible = false;
   $('stCursor').textContent = '';
 });
+function setPivot(tab, point) {
+  const off = tab.camera.position.clone().sub(tab.target);
+  animateCamera(tab, point.clone().add(off), point.clone(), tab.camera.zoom, 250);
+}
 canvas.addEventListener('dblclick', (e) => {
   const tab = active;
-  if (!tab || tab.loading) return;
+  // on touch screens a quick second tap picks a face of the selected part; the long-press menu sets the pivot
+  if (!tab || tab.loading || lastPointerType === 'touch') return;
   const hit = pick(e);
-  if (!hit) return;
-  const off = tab.camera.position.clone().sub(tab.target);
-  animateCamera(tab, hit.point.clone().add(off), hit.point, tab.camera.zoom, 250);
+  if (hit) setPivot(tab, hit.point);
 });
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
@@ -2650,6 +2693,7 @@ function processHover() {
 }
 
 /** right click on the model: the part under the cursor becomes the selection unless it already is part of it */
+let ctxPoint = null; // model point under the last right click / long press (menu: new rotation center)
 function onRightClick(e) {
   const tab = active;
   if (!tab || tab.loading) return;
@@ -2660,7 +2704,7 @@ function onRightClick(e) {
     const f = brepFaceOf(hit.part, hit.tri);
     if (f >= 0) clickEntity(tab, { kind: 'face', part: hit.part, f, point: hit.point.clone(), viewNormal: hit.normal.clone(), key: `${hit.part.id}:f:${f}` });
   }
-  openContextMenu(e.clientX, e.clientY, !!hit);
+  openContextMenu(e.clientX, e.clientY, !!hit, hit ? hit.point.clone() : null);
 }
 
 function onClick(e) {
@@ -2703,6 +2747,8 @@ function onClick(e) {
 // ---------------------------------------------------------------- keyboard
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !$('dxfDlg').classList.contains('hidden')) { e.preventDefault(); closeDxfDialog(); return; }
+  if (e.key === 'Escape' && $('topExtra').classList.contains('open')) { closeMore(); return; }
+  if (e.key === 'Escape' && document.body.classList.contains('drawer-open')) { setDrawer(false); return; }
   if (e.target.tagName === 'INPUT' && e.target.type !== 'range' && e.target.type !== 'checkbox' && e.target.type !== 'color' || e.target.tagName === 'SELECT') return;
   const k = e.key.toLowerCase();
   if (e.ctrlKey && k === 'o') { e.preventDefault(); $('fileInput').click(); return; }
@@ -2779,6 +2825,56 @@ window.addEventListener('drop', (e) => {
   openFiles([...e.dataTransfer.files]);
 });
 $('btnHelp').onclick = () => $('help').classList.remove('hidden');
+
+// ---------------------------------------------------------------- phone layout (see the compact media query in style.css)
+const COMPACT = window.matchMedia('(max-width: 820px), (max-height: 520px) and (max-width: 1000px)');
+function setDrawer(open) {
+  document.body.classList.toggle('drawer-open', open);
+  $('btnTree').classList.toggle('on', open);
+}
+function closeMore() { $('topExtra').classList.remove('open'); $('btnMore').classList.remove('on'); }
+$('btnTree').onclick = () => { closeMore(); setDrawer(!document.body.classList.contains('drawer-open')); };
+$('drawerBackdrop').onclick = () => setDrawer(false);
+$('btnMore').onclick = () => { const open = !$('topExtra').classList.contains('open'); setDrawer(false); $('topExtra').classList.toggle('open', open); $('btnMore').classList.toggle('on', open); };
+$('topExtra').addEventListener('click', (e) => { if (COMPACT.matches && e.target.closest('button')) closeMore(); });
+window.addEventListener('pointerdown', (e) => { if (!e.target.closest('#topExtra, #btnMore')) closeMore(); }, true);
+COMPACT.addEventListener('change', () => { setDrawer(false); closeMore(); });
+// phones: a panel's title folds it to one line
+const foldTitles = [...document.querySelectorAll('.floating > .panel-head > span:first-child')];
+function toggleFold(t) {
+  if (!COMPACT.matches) return;
+  const p = t.closest('.floating');
+  p.classList.toggle('collapsed');
+  t.setAttribute('aria-expanded', String(!p.classList.contains('collapsed')));
+}
+function syncFoldTitles() {
+  for (const t of foldTitles) {
+    if (COMPACT.matches) {
+      t.setAttribute('role', 'button'); t.tabIndex = 0;
+      t.setAttribute('aria-expanded', String(!t.closest('.floating').classList.contains('collapsed')));
+    } else {
+      t.removeAttribute('role'); t.removeAttribute('tabindex'); t.removeAttribute('aria-expanded');
+      t.closest('.floating').classList.remove('collapsed');
+    }
+  }
+}
+for (const t of foldTitles) {
+  t.addEventListener('click', () => toggleFold(t));
+  t.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleFold(t); } });
+}
+syncFoldTitles();
+COMPACT.addEventListener('change', syncFoldTitles);
+// the tool row scrolls sideways on phones: fade the side that has more tools
+const toolbarEl = $('toolbar');
+function syncToolbarFade() {
+  const max = toolbarEl.scrollWidth - toolbarEl.clientWidth;
+  toolbarEl.classList.toggle('more-right', max > 2 && toolbarEl.scrollLeft < max - 2);
+  toolbarEl.classList.toggle('more-left', max > 2 && toolbarEl.scrollLeft > 2);
+}
+toolbarEl.addEventListener('scroll', syncToolbarFade, { passive: true });
+// panels at the top start below the toolbar, however many rows it wraps into
+function syncToolbarSize() { syncToolbarFade(); viewportEl.style.setProperty('--tb-bottom', `${toolbarEl.offsetTop + toolbarEl.offsetHeight}px`); }
+new ResizeObserver(syncToolbarSize).observe(toolbarEl);
 
 // ---------------------------------------------------------------- update check / self update
 // The local server asks GitHub for the latest release; the update downloads the new exe, swaps it in and
@@ -2926,7 +3022,7 @@ $('splitter').addEventListener('pointerdown', (e) => {
 // ---------------------------------------------------------------- render loop
 const triad = document.createElement('canvas');
 triad.width = triad.height = 90 * basePixelRatio;
-Object.assign(triad.style, { position: 'absolute', left: '8px', bottom: '8px', width: '90px', height: '90px', pointerEvents: 'none' });
+triad.id = 'triad'; // position and size in style.css (smaller and moved on phones)
 viewportEl.appendChild(triad);
 const tctx = triad.getContext('2d');
 function drawTriad(cam) {

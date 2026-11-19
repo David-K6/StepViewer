@@ -75,7 +75,7 @@ input[type=range] { accent-color: var(--acc); }
 .opacity-group .lbl { color: var(--muted); font-size: 12px; }
 .opacity-group input { width: 110px; }
 
-.floating { position: absolute; right: 8px; top: 58px; width: 320px; background: #1b1e23ee; border: 1px solid var(--line); border-radius: 8px; padding-bottom: 8px; backdrop-filter: blur(4px); }
+.floating { position: absolute; right: 8px; top: calc(var(--tb-bottom, 50px) + 8px); width: 320px; background: #1b1e23ee; border: 1px solid var(--line); border-radius: 8px; padding-bottom: 8px; backdrop-filter: blur(4px); }
 #measurePanel { top: auto; bottom: 8px; max-height: 45%; display: flex; flex-direction: column; }
 .sec-row { display: grid; grid-template-columns: 46px 1fr 72px 28px; gap: 6px; align-items: center; padding: 3px 8px; }
 .sec-row[data-axis=c] { grid-template-columns: 46px 1fr 72px 28px; }
@@ -160,3 +160,123 @@ input[type=range] { accent-color: var(--acc); }
 .dxf-row input, .dxf-row select { flex: 1; min-width: 0; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 5px 7px; font: inherit; }
 .dxf-row .btn { margin-top: 0; float: none; }
 .upd-msg.ok { color: #7ee787; }
+
+/* ---------------------------------------------------------------- touch + phone layout */
+html, body { height: 100dvh; }
+body { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.mob-only { display: none !important; }
+.touch-only { display: none !important; }
+.topbar-extra { display: flex; align-items: center; gap: 8px; }
+.drawer-backdrop { display: none; }
+#triad { position: absolute; left: 8px; bottom: 8px; width: 90px; height: 90px; pointer-events: none; }
+@media (pointer: coarse) {
+  #help td:first-child { font-family: inherit; white-space: nowrap; padding-right: 12px; }
+  .touch-only { display: revert !important; }
+  tbody.touch-only { display: table-row-group !important; }
+  .desk-only { display: none !important; }
+}
+
+/* compact: phones in portrait (narrow) and in landscape (short) */
+@media (max-width: 820px), (max-height: 520px) and (max-width: 1000px) {
+  :root { --top-h: 46px; --status-h: 20px; --bar-h: 58px; }
+  .mob-only { display: inline-flex !important; align-items: center; justify-content: center; }
+  html, body { font-size: 14px; }
+  input, select, textarea { font-size: 16px !important; } /* iOS zooms into smaller inputs */
+
+  #topbar { height: var(--top-h); gap: 6px; padding: 0 6px; }
+  #topbar .btn.icon { width: 38px; height: 36px; padding: 0; font-size: 18px; flex: none; }
+  .brand { display: none; }
+  #btnOpen { flex: none; height: 36px; padding: 0 12px; white-space: nowrap; }
+  #tabs { flex: 1 1 auto; scrollbar-width: none; }
+  #tabs::-webkit-scrollbar { display: none; }
+  .tab { max-width: 150px; padding: 6px 6px 6px 10px; }
+  .tab .x { font-size: 18px; padding: 2px 6px; }
+  #topbar .spacer { display: none; }
+  .topbar-extra { display: none; position: fixed; top: calc(var(--top-h) + 4px); right: 6px; z-index: 46; flex-direction: column; align-items: stretch; gap: 8px;
+    min-width: 210px; padding: 10px; background: #2b3038f8; border: 1px solid #4b5260; border-radius: 8px; box-shadow: 0 8px 24px #0009; }
+  .topbar-extra.open { display: flex; }
+  .topbar-extra .btn { height: 40px; }
+  .topbar-extra #btnHelp { width: auto !important; padding: 0 12px; font-size: inherit !important; }
+  .topbar-extra #btnHelp::after { content: " 도움말"; }
+  .qsel { justify-content: space-between; }
+  .qsel select { height: 38px; }
+
+  #main { height: calc(100% - var(--top-h) - var(--status-h)); position: relative; }
+  #left { position: absolute; z-index: 40; top: 0; bottom: 0; left: 0; width: min(86vw, 360px) !important; max-width: none; min-width: 0;
+    transform: translateX(-102%); transition: transform .2s ease; box-shadow: 4px 0 24px #000a; }
+  body.drawer-open #left { transform: none; }
+  body.drawer-open .drawer-backdrop { display: block; position: absolute; inset: 0; z-index: 39; background: #0008; }
+  #splitter { display: none; }
+  .tnode { height: 38px; }
+  .tnode .tw { width: 24px; font-size: 12px; }
+  .tnode .eye { width: 34px; font-size: 15px; }
+  .search { padding: 8px 10px; }
+  .btn.sm { padding: 6px 10px; font-size: 13px; }
+  .props .row-btns { gap: 6px; }
+  input[type=color] { width: 40px; height: 32px; }
+  input[type=range] { height: 28px; }
+
+  #status { height: var(--status-h); gap: 10px; font-size: 11px; }
+  #stCursor, #stPerf { display: none; }
+
+  /* tools: one scrollable row at the bottom, in thumb reach */
+  #toolbar { top: auto; bottom: 6px; left: 6px; right: 6px; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; pointer-events: auto; gap: 6px; }
+  #toolbar::-webkit-scrollbar { display: none; }
+  /* a faded edge says the row scrolls on */
+  #toolbar.more-right { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent); }
+  #toolbar.more-left { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 36px), transparent); }
+  #toolbar.more-left.more-right { -webkit-mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent); }
+  #toolbar .group { flex: none; }
+  .tool { min-width: 46px; height: 46px; font-size: 17px; }
+  .opacity-group .lbl { display: none; }
+  .opacity-group input { width: 96px; }
+
+  .floating { left: 6px; right: 6px; top: 6px; width: auto; max-height: 46%; overflow: auto; }
+  #sectionPanel .sec-row { grid-template-columns: 40px minmax(0, 1fr) 68px 40px; gap: 5px; }
+  #sectionPanel .sec-row > * { min-width: 0; }
+  #sectionPanel .sec-row input[type=range] { width: 100%; }
+  #sectionPanel .sec-row input[type=number] { width: 68px; }
+  #sectionPanel .sec-row .btn { padding-left: 4px; padding-right: 4px; }
+  #sectionPanel .sec-opts { flex-wrap: wrap; gap: 8px 12px; }
+  #sectionPanel .sec-flip { height: 34px; }
+  #measurePanel, #entityPanel { top: auto; left: 6px; right: 6px; width: auto; bottom: calc(var(--bar-h) + 6px); max-height: 34%; }
+  /* tap a panel's title to fold it to one line (the model stays reachable) */
+  .floating > .panel-head > span:first-child { cursor: pointer; }
+  .floating > .panel-head > span:first-child::after { content: " ▾"; color: var(--muted); font-weight: 400; }
+  .floating.collapsed > .panel-head > span:first-child::after { content: " ▸"; }
+  .floating.collapsed > :not(.panel-head) { display: none !important; }
+  .floating.collapsed { padding-bottom: 0; }
+  /* one bottom sheet at a time: picked faces/edges win over the measurement list */
+  #viewport:has(#entityPanel:not(.hidden)) #measurePanel { display: none; }
+  #triad { left: auto; right: 4px; bottom: calc(var(--bar-h) + 4px); width: 64px; height: 64px; }
+  #viewport:has(#entityPanel:not(.hidden)) #triad, #viewport:has(#measurePanel:not(.hidden)) #triad { display: none; }
+  .toast { bottom: calc(var(--bar-h) + 12px); max-width: 92%; }
+  .loading { max-width: 90%; }
+  .empty { padding: 0 20px 70px; text-align: center; }
+  .empty .drop-icon { font-size: 48px; }
+  .empty .big { font-size: 16px; }
+  .empty .btn { height: 44px; padding: 0 22px; }
+
+  .ctxmenu { min-width: 250px; max-width: calc(100vw - 12px); }
+  .ctxmenu button { padding: 11px 12px; font-size: 15px; }
+  .ctxmenu .k { display: none; }
+
+  .modal { align-items: center; padding: 8px; }
+  .modal-body, .modal-body.upd, .modal-body.dxf { min-width: 0; width: min(94vw, 520px); max-height: calc(100dvh - 24px); overflow: auto; padding: 14px 16px; }
+  .modal-body table { font-size: 13px; }
+  .modal-body .btn { height: 40px; }
+  .dxf-row { flex-wrap: wrap; white-space: normal; }
+  #dxfDirRow label { width: 100%; }
+  .dxf-row input, .dxf-row select { height: 40px; }
+  .upd-actions { flex-wrap: wrap; }
+}
+/* landscape phones: every pixel of height counts */
+@media (max-height: 520px) and (max-width: 1000px) {
+  :root { --top-h: 42px; --status-h: 0px; --bar-h: 54px; }
+  #status { display: none; }
+  .tool { height: 42px; }
+  .tool small { display: none; }
+  .floating { max-height: 60%; }
+  #measurePanel, #entityPanel { max-height: 55%; left: auto; width: min(320px, 40vw); }
+  .modal-body table { font-size: 12px; }
+}
