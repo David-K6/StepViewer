@@ -142,6 +142,8 @@ function fk(text, values) { // -> link -> { R, t (mm) }
   let srv = null, browser = null, profile = null;
   const errors = [];
   const post = (paths) => fetch(`http://127.0.0.1:${PORT}/api/open`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths }) });
+  // files picked together (open dialog / MCP): same lookup, but references picked with an assembly/URDF get no tab
+  const pick = (paths) => fetch(`http://127.0.0.1:${PORT}/api/rpc`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-StepViewer': '1' }, body: JSON.stringify({ cmd: 'open', args: { paths } }) });
   try {
     srv = spawn(process.execPath, [path.join(root, 'server.js'), `--port=${PORT}`], {
       env: { ...process.env, STEPVIEWER_NO_BROWSER: '1', STEPVIEWER_KEEPALIVE: '1' }, stdio: 'pipe' });
@@ -380,12 +382,18 @@ function fk(text, values) { // -> link -> { R, t (mm) }
       'mimic multiplier 0 out of limits is reported; a tiny multiplier still narrows the master ([-0.5, 0.5] rad)', JSON.stringify(st));
     await ev(() => window.__sv.tabs.length && document.querySelectorAll('.tab .x')[window.__sv.tabs.length - 1].click());
 
-    // ---------------- opened by path together with its meshes (native '열기' dialog, Explorer multi-select):
-    // the meshes only serve the URDF, one tab
+    // ---------------- picked by path together with its meshes (native '열기' dialog, MCP): the meshes only serve
+    // the URDF, one tab. From the command line / Explorer every file keeps its own tab (as in 0.0.6).
     {
-      const n1 = await ev(() => window.__sv.tabs.length);
       const meshDir = path.join(tmp, 'bot_description', 'meshes');
-      await post([synth.file, ...fs.readdirSync(meshDir).filter((f) => /\.(stl|obj)$/i.test(f)).map((f) => path.join(meshDir, f))]);
+      const n0 = await ev(() => window.__sv.tabs.length);
+      await post([synth.file, path.join(meshDir, 'arm.stl')]);
+      await waitLoaded(n0 + 2);
+      const cl = await ev((k) => window.__sv.tabs.slice(k).map((t) => t.name).sort(), n0);
+      check(JSON.stringify(cl) === JSON.stringify(['arm.stl', 'bot.urdf']), 'command line / Explorer: each file given together opens as its own tab', JSON.stringify(cl));
+      for (let i = 0; i < 2; i++) await ev(() => document.querySelectorAll('.tab .x')[window.__sv.tabs.length - 1].click());
+      const n1 = await ev(() => window.__sv.tabs.length);
+      await pick([synth.file, ...fs.readdirSync(meshDir).filter((f) => /\.(stl|obj)$/i.test(f)).map((f) => path.join(meshDir, f))]);
       await waitLoaded(n1 + 1);
       await wait(500);
       const s2 = await ev(() => ({ n: window.__sv.tabs.length, name: window.__sv.active.name, joints: window.__sv.active.robot && window.__sv.active.robot.ui.length, toast: document.getElementById('toast').textContent }));
@@ -398,7 +406,7 @@ function fk(text, values) { // -> link -> { R, t (mm) }
         const fu = path.join(near, 'far.urdf');
         fs.writeFileSync(fu, '<robot name="far"><link name="a"><visual><geometry><mesh filename="package://nowhere/meshes/far_arm.stl"/></geometry></visual></link></robot>');
         const n2 = await ev(() => window.__sv.tabs.length);
-        await post([fu, path.join(far, 'far_arm.stl')]);
+        await pick([fu, path.join(far, 'far_arm.stl')]);
         await waitLoaded(n2 + 1);
         const s3 = await ev(() => ({ n: window.__sv.tabs.length, name: window.__sv.active.name, parts: window.__sv.active.parts.length, missing: window.__sv.active.missing }));
         check(s3.n === n2 + 1 && s3.name === 'far.urdf' && s3.parts === 1 && !s3.missing.length, 'a mesh chosen together from another folder is used by the URDF', JSON.stringify(s3));
@@ -422,13 +430,13 @@ function fk(text, values) { // -> link -> { R, t (mm) }
         fs.writeFileSync(path.join(near, 'iso', 'sub', 'meshes', 'link.stl'), sizeOf(0.01));
         const sizes = async (n) => ev((k) => window.__sv.tabs.slice(k).map((t) => [t.name, Math.round(t.box.max.x - t.box.min.x), t.missing.length]), n);
         let n3 = await ev(() => window.__sv.tabs.length);
-        await post([path.join(near, 'pa', 'urdf', 'pa.urdf'), path.join(near, 'pb', 'urdf', 'pb.urdf'), path.join(near, 'pa', 'meshes', 'link.stl'), path.join(near, 'pb', 'meshes', 'link.stl')]);
+        await pick([path.join(near, 'pa', 'urdf', 'pa.urdf'), path.join(near, 'pb', 'urdf', 'pb.urdf'), path.join(near, 'pa', 'meshes', 'link.stl'), path.join(near, 'pb', 'meshes', 'link.stl')]);
         await waitLoaded(n3 + 2);
         let sz = await sizes(n3);
         check(JSON.stringify(sz) === JSON.stringify([['pa.urdf', 50, 0], ['pb.urdf', 200, 0]]), 'same-named meshes of two packages chosen together: each URDF uses its own', JSON.stringify(sz));
         for (let i = 0; i < 2; i++) await ev(() => document.querySelectorAll('.tab .x')[window.__sv.tabs.length - 1].click());
         n3 = await ev(() => window.__sv.tabs.length);
-        await post([path.join(near, 'iso', 'sub', 'far_pa.urdf'), path.join(near, 'iso', 'sub', 'far_pb.urdf'), path.join(far, 'pb', 'meshes', 'link.stl'), path.join(far, 'pa', 'meshes', 'link.stl')]);
+        await pick([path.join(near, 'iso', 'sub', 'far_pa.urdf'), path.join(near, 'iso', 'sub', 'far_pb.urdf'), path.join(far, 'pb', 'meshes', 'link.stl'), path.join(far, 'pa', 'meshes', 'link.stl')]);
         await waitLoaded(n3 + 2);
         sz = await sizes(n3);
         check(JSON.stringify(sz) === JSON.stringify([['far_pa.urdf', 50, 0], ['far_pb.urdf', 200, 0]]), 'same-named meshes chosen from elsewhere: matched by package path, ahead of a same-named file next to the URDF', JSON.stringify(sz));

@@ -3180,10 +3180,12 @@ window.addEventListener('keydown', (e) => {
 });
 
 // ---------------------------------------------------------------- files: button, drag & drop, server push
-/** files the local server can read by path (command line, Explorer, native dialog): references (assembly parts,
- *  URDF meshes) come from next to the file, so files picked together with an assembly/URDF are not opened again */
-function openServerFiles(list) {
-  const hasUrdf = list.some((f) => isUrdf(f.name)), hasAsm = list.some((f) => isAsm(f.name));
+/** files the local server can read by path (command line, Explorer, native dialog, MCP). References (assembly parts,
+ *  URDF meshes) come from next to the file or from the files given together.
+ *  @param group true for a pick (open dialog, MCP): files picked together with an assembly/URDF only serve as its
+ *  references, like a drop. false (command line, Explorer "Open"): every file gets its own tab, as before. */
+function openServerFiles(list, group = true) {
+  const hasUrdf = group && list.some((f) => isUrdf(f.name)), hasAsm = group && list.some((f) => isAsm(f.name));
   const isRef = (f) => (hasUrdf && MESH_REF.test(f.name)) || (hasAsm && !isAsm(f.name) && !isUrdf(f.name) && !MESH_REF.test(f.name));
   const refs = list.filter(isRef).length;
   if (refs) toast(`${hasUrdf && hasAsm ? 'URDF·조립품' : hasUrdf ? 'URDF' : '조립품'}과 함께 고른 파일 ${refs}개는 참조용으로만 사용합니다.`);
@@ -3438,7 +3440,7 @@ function connectServer() {
       else if (h.version !== bootVersion) location.href = '/';
     } catch { /* ignore */ }
   });
-  es.addEventListener('openfiles', (ev) => openServerFiles(JSON.parse(ev.data)));
+  es.addEventListener('openfiles', (ev) => openServerFiles(JSON.parse(ev.data), false)); // command line / Explorer: a tab each
   es.addEventListener('focus', () => window.focus());
   // automation (MCP): the server sends a command to the window used last, the result goes back by POST
   const running = new Map(); // command id -> { cancelled, onCancel: [] }

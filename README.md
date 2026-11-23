@@ -6,7 +6,7 @@ A lightweight STEP / IGES / BREP / **SolidWorks (SLDPRT, SLDASM)** / **Parasolid
 
 - Double-click `dist\StepViewer.exe`. The viewer opens in a frameless Edge (or Chrome) app window. No installation is needed and it works fully offline.
 - `StepViewer.exe a.step b.SLDASM robot.urdf` opens each file in its own tab.
-- "+ 열기" (Ctrl+O) shows the Windows open dialog. Several files can be picked at once; files referenced by an assembly or URDF (its parts / meshes) are read from next to it, so picking the `.SLDASM` or `.urdf` alone is enough.
+- "+ 열기" (Ctrl+O) shows the Windows open dialog. Several files can be picked at once; files referenced by an assembly or URDF (its parts / meshes) are read from next to it, so picking the `.SLDASM` or `.urdf` alone is enough. Part or mesh files picked together with an assembly or URDF only serve as its references (no tab of their own), like files dropped together; files passed on the command line or opened from Explorer each get a tab.
 - If StepViewer is already running, launching it again opens the new files as tabs in the existing window instead of starting a second copy.
 - To open `.step`, `.sldprt`, `.sldasm`, `.x_t`, `.urdf` or `.stl` files by double-clicking them, set StepViewer.exe as the default app for that file type in Windows' "Open with" dialog.
 - StepViewer quits automatically once the last viewer window is closed. The log is written to `%TEMP%\StepViewer.log`.
@@ -124,7 +124,7 @@ A typical sequence: `open_files` → `get_joints` → `set_joints` → `set_view
 | `set_section` | section plane normal to x / y / z at a position in mm (flip, caps), or off |
 | `screenshot` | PNG of the 3D view as it is shown (longest side up to 4096 px) |
 
-Every tool takes an optional `tab` (name or `#index`, default: the active tab). Arguments are checked against each tool's schema (unknown or misspelt arguments are refused), and a cancelled call is undone in the viewer (a file still loading is closed).
+The tools that work on one tab (`get_model`, `get_joints`, `set_joints`, `set_view`, `set_visibility`, `select_parts`, `set_section`, `screenshot`) take an optional `tab` (name or `#index`, default: the active tab); `manage_tab` requires it. Arguments are checked against each tool's schema (unknown or misspelt arguments are refused). Cancelling `open_files` closes the tabs it opened, even while they are still loading; changes made by other tools (joints, visibility, section, view) take effect immediately and stay.
 
 ### How it works / security
 
