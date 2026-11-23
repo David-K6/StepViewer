@@ -1,6 +1,6 @@
 {
   "name": "stepviewer",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Lightweight STEP/IGES viewer (single exe)",
   "main": "server.js",
   "scripts": {
@@ -13,7 +13,9 @@
     "web": "node scripts/vendor.js && node scripts/web.js",
     "webtest": "node scripts/webtest.js",
     "xttest": "node scripts/xttest.js",
-    "mobiletest": "node scripts/mobiletest.js"
+    "mobiletest": "node scripts/mobiletest.js",
+    "urdftest": "node scripts/urdftest.js",
+    "mcptest": "node scripts/mcptest.js"
   },
   "keywords": [],
   "author": "",

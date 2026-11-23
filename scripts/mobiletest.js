@@ -68,7 +68,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
       if (compact) check(Math.abs(lay.canvasW - W) < 1, tag('3D view uses the full width'), `${lay.canvasW} / ${W}`);
       const topItems = await ev(() => [...document.querySelectorAll('#topbar > button, #topbar > .btn')].filter((b) => getComputedStyle(b).display !== 'none').map((b) => { const r = b.getBoundingClientRect(); return { id: b.id, x: r.left, r: r.right, h: r.height }; }));
       check(topItems.every((b) => b.x >= 0 && b.r <= W + 0.5), tag('top bar buttons inside the screen'), JSON.stringify(topItems.map((b) => `${b.id}:${Math.round(b.x)}-${Math.round(b.r)}`)));
-      const tools = await ev(() => [...document.querySelectorAll('#toolbar .tool')].map((t) => { const r = t.getBoundingClientRect(); return { w: r.width, h: r.height }; }));
+      const tools = await ev(() => [...document.querySelectorAll('#toolbar .tool')].filter((t) => getComputedStyle(t).display !== 'none').map((t) => { const r = t.getBoundingClientRect(); return { w: r.width, h: r.height }; }));
       check(tools.every((t) => t.h >= (compact ? 40 : 30) && t.w >= 36), tag('tool buttons are large enough to touch'), `min ${Math.min(...tools.map((t) => t.h))} px`);
       const tb = await rect('#toolbar');
       check(inside(tb), tag('toolbar inside the screen'), JSON.stringify(tb));

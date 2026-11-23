@@ -58,10 +58,10 @@ const workerAssetsReady = (async () => {
       if (!r.ok) throw new Error(`${u}: ${r.status}`);
       return URL.createObjectURL(new Blob([await r.arrayBuffer()], { type }));
     };
-    const [occt, sw, xt, wasm, wk] = await Promise.all([
+    const [occt, sw, xt, urdf, wasm, wk] = await Promise.all([
       blobUrl('vendor/occt-import-js.js', 'text/javascript'), blobUrl('swfile.js', 'text/javascript'), blobUrl('xtfile.js', 'text/javascript'),
-      blobUrl('vendor/occt-import-js.wasm', 'application/wasm'), blobUrl('worker.js', 'text/javascript')]);
-    const boot = `self.__svAssets=${JSON.stringify({ occt, sw, xt, wasm })};importScripts(${JSON.stringify(wk)});`;
+      blobUrl('urdffile.js', 'text/javascript'), blobUrl('vendor/occt-import-js.wasm', 'application/wasm'), blobUrl('worker.js', 'text/javascript')]);
+    const boot = `self.__svAssets=${JSON.stringify({ occt, sw, xt, urdf, wasm })};importScripts(${JSON.stringify(wk)});`;
     workerUrl = URL.createObjectURL(new Blob([boot], { type: 'text/javascript' }));
   } catch (e) { console.warn('[StepViewer] worker prefetch failed, using the server copy', e); }
 })();
@@ -249,6 +249,7 @@ function activateTab(tab) {
   if (camAnim) { camAnim.step(Infinity); camAnim = null; }
   if (active) {
     cancelPending();
+    if (active.robot) showJointAxis(active, null);
     active.overlay.traverse((o) => { if (o.isCSS2DObject) o.element.style.display = 'none'; });
   }
   active = tab;
@@ -266,6 +267,7 @@ function activateTab(tab) {
   updateProps();
   syncToolbar();
   syncSectionUI();
+  syncJointUI();
   renderMeasureList();
   renderEntityPanel(tab);
   updateStatus();
@@ -279,7 +281,7 @@ function closeTab(tab) {
   if (i < 0) return;
   tab.closed = true;
   tabs.splice(i, 1);
-  if (tab.loading) pool.cancel(tab);
+  if (tab.loading) { pool.cancel(tab); if (tab.abortLoad) tab.abortLoad(); } // parser job and file downloads
   for (const p of tab.parts) {
     p.mesh.geometry.disposeBoundsTree?.();
     p.mesh.geometry.dispose();
@@ -290,6 +292,7 @@ function closeTab(tab) {
   if (tab.pending) { disposeMeasure(tab.pending); tab.pending = null; }
   if (tab.entGroup) { clearGroup(tab.entGroup); clearGroup(tab.entHoverGroup); tab.entities = []; }
   for (const p of tab.parts) disposeFaceCache(p);
+  if (tab.robot) showJointAxis(tab, null);
   disposeSectionObjs(tab);
   tab.scene.clear(); tab.overlay.clear();
   if (active === tab) { active = null; activateTab(tabs[Math.min(i, tabs.length - 1)] || null); }
@@ -298,12 +301,18 @@ function closeTab(tab) {
 }
 
 // ---------------------------------------------------------------- loading
-const CAD_EXT = /\.(step|stp|iges|igs|brep|brp|sldprt|sldasm|x_t|xmt_txt)$/i;
+const CAD_EXT = /\.(step|stp|iges|igs|brep|brp|sldprt|sldasm|x_t|xmt_txt|urdf|stl|obj)$/i;
+// files that reference others: dropped together with their parts (assembly) or meshes (URDF), these open as tabs
 const isAsm = (n) => /\.sldasm$/i.test(n);
+const isUrdf = (n) => /\.urdf$/i.test(n);
+const MESH_REF = /\.(stl|obj|dae)$/i;
+const refBase = (s) => s.replace(/\\/g, '/').split('/').pop();
 
 /** SolidWorks keeps original reference names ("rear container.SLDPRT") while Pack and Go adds
  *  suffixes ("rear container_261022.SLDPRT"): exact name first, then "<stem>[_ -]*.<same ext>". */
 function matchRefName(names, want) {
+  // URDF mesh references ("package://pkg/meshes/x.stl"): exact file name only
+  if (MESH_REF.test(want)) { const b = refBase(want).toLowerCase(); return names.find((n) => n.toLowerCase() === b) || null; }
   const w = want.toLowerCase();
   const exact = names.find((n) => n.toLowerCase() === w);
   if (exact) return exact;
@@ -319,12 +328,19 @@ async function openFiles(fileList) {
   const files = [...fileList];
   for (const f of files) if (!CAD_EXT.test(f.name)) toast(`지원하지 않는 형식: ${f.name}`, true);
   const cad = files.filter((f) => CAD_EXT.test(f.name));
-  // dropping an assembly together with its part files: the other files only serve as references
-  const asms = cad.filter((f) => isAsm(f.name));
-  const open = asms.length ? asms : cad;
-  const refs = asms.length ? cad.filter((f) => !isAsm(f.name)) : [];
-  if (refs.length) toast(`조립품과 함께 놓은 파일 ${refs.length}개는 조립품 참조용으로만 사용합니다.`);
-  const byName = new Map(cad.map((f) => [f.name, f]));
+  // dropped together with an assembly, part/STEP files only serve as its references; dropped together with a
+  // URDF, mesh files (STL/OBJ) only serve as its meshes. Everything else opens as a tab.
+  const asms = cad.filter((f) => isAsm(f.name)), urdfs = cad.filter((f) => isUrdf(f.name));
+  const isMesh = (f) => MESH_REF.test(f.name);
+  const isRef = (f) => (urdfs.length && isMesh(f)) || (asms.length && !isAsm(f.name) && !isUrdf(f.name) && !isMesh(f));
+  const open = cad.filter((f) => !isRef(f));
+  const refs = cad.filter(isRef);
+  if (refs.length) toast(`${urdfs.length && asms.length ? 'URDF·조립품' : urdfs.length ? 'URDF' : '조립품'}과 함께 놓은 파일 ${refs.length}개는 참조용으로만 사용합니다.`);
+  // file names are the only key a web page gets: the same name twice is ambiguous (the first one is used)
+  const dup = [...new Set(cad.map((f) => f.name.toLowerCase()).filter((n, i, a) => a.indexOf(n) !== i))];
+  if (dup.length) toast(`같은 이름의 파일이 여러 개입니다 (${dup.slice(0, 3).join(', ')}). 참조에는 첫 번째 파일을 사용합니다.`, true);
+  const byName = new Map();
+  for (const f of cad) if (!byName.has(f.name)) byName.set(f.name, f);
   const resolveFile = async (want) => {
     const hit = matchRefName([...byName.keys()], want);
     return hit ? byName.get(hit).arrayBuffer() : null;
@@ -406,25 +422,26 @@ async function loadBuffer(name, getBuffer, size, resolveFile = null) {
   try {
     const quality = $('quality').value;
     const buffer = await getBuffer(tab);
+    if (tab.closed) return tab; // closed while reading: no hashing, no parsing
     if (!size) size = buffer.byteLength;
     // cache key = file content hash (not name/mtime), so different files can never collide
     const hash = await contentHash(buffer);
     const popt = window.__svParseOpts && Object.keys(window.__svParseOpts).length ? '|' + JSON.stringify(window.__svParseOpts) : '';
     // v3: entries written by older versions (no corrupted-face filtering, cached partial assemblies) are ignored
     // sw2: SolidWorks results carry the files' appearance colors; v4: OpenCascade colors are converted to sRGB
-    const fmtVer = /\.sld(prt|asm)$/i.test(name) ? 'sw2|' : /\.(x_t|xmt_txt)$/i.test(name) ? 'xt1|' : '';
+    const fmtVer = /\.sld(prt|asm)$/i.test(name) ? 'sw2|' : /\.(x_t|xmt_txt)$/i.test(name) ? 'xt1|' : /\.(stl|obj|urdf)$/i.test(name) ? 'mesh1|' : '';
     const cacheKey = hash ? `v4|${fmtVer}${quality}${popt}|${buffer.byteLength}|${hash}` : null;
     let result = cacheKey ? await cacheGet(cacheKey) : null;
     // results depending on other files must never come from the cache (older versions could store them)
     if (result && ((result.missing && result.missing.length) || (result.usedSiblings && result.usedSiblings.length) || !cachedGeometryOk(result))) result = null;
     const fromCache = !!result;
-    if (tab.closed) return;
+    if (tab.closed) return tab;
     if (!result) {
       result = await pool.parse(name, buffer, quality, resolveFile, window.__svParseOpts || {}, tab);
       // results that depend on other files (used or missing ones) change when those files do -> never cache them
       if (cacheKey && !tab.closed && !(result.usedSiblings && result.usedSiblings.length) && !(result.missing && result.missing.length)) cachePut(cacheKey, result);
     }
-    if (tab.closed) return;
+    if (tab.closed) return tab;
     const tParsed = performance.now();
     buildModel(tab, result);
     const tBuilt = performance.now();
@@ -434,30 +451,39 @@ async function loadBuffer(name, getBuffer, size, resolveFile = null) {
     console.info(`[StepViewer] ${name}: ${tab.loadInfo}`, result.timing);
     tab.missing = result.missing || [];
     const warn = [];
-    if (tab.missing.length) {
+    if (result.robot && tab.missing.length) {
+      const list = tab.missing.slice(0, 4).join(', ') + (tab.missing.length > 4 ? ` 외 ${tab.missing.length - 4}개` : '');
+      warn.push(`메시 파일 ${tab.missing.length}개를 찾지 못했습니다 (${list}). URDF와 같은 폴더(또는 패키지의 meshes 폴더)에 두고 '열기' 버튼으로 열거나, 메시 파일을 URDF와 함께 선택·끌어다 놓으세요.`);
+    } else if (tab.missing.length) {
       const list = tab.missing.slice(0, 4).join(', ') + (tab.missing.length > 4 ? ` 외 ${tab.missing.length - 4}개` : '');
       warn.push(`표시 데이터가 없는 부품 ${tab.missing.length}개를 건너뛰었습니다 (${list}). 부품(또는 원본 STEP) 파일을 같은 폴더에 두고 열거나, 조립품과 함께 끌어다 놓으세요.`);
     }
     if (result.invalidFaces) warn.push(`손상된 표시 데이터 면 ${result.invalidFaces}개를 건너뛰었습니다. 파일이 손상되었을 수 있습니다.`);
     const xs = result.xtSkipped;
     if (xs && (xs.faces || xs.bodies)) warn.push(`지원하지 않는 Parasolid 형상이 있어 ${xs.faces ? `면 ${xs.faces}개` : ''}${xs.faces && xs.bodies ? ', ' : ''}${xs.bodies ? `바디 ${xs.bodies}개` : ''}를 표시하지 못했습니다.`);
+    if (result.warnings && result.warnings.length) {
+      console.warn(`[StepViewer] ${name}:\n${result.warnings.join('\n')}`);
+      warn.push(result.warnings.slice(0, 3).join(' / ') + (result.warnings.length > 3 ? ` (외 ${result.warnings.length - 3}건, 콘솔 참조)` : ''));
+    }
     if (warn.length) toast(`${name}: ${warn.join(' / ')}`, true);
     if (active === tab) {
       controls.enabled = true;
       $('loading').classList.add('hidden');
-      renderTree(); updateStatus(); syncSectionUI(); updateProps();
+      renderTree(); updateStatus(); syncSectionUI(); updateProps(); syncJointUI(true);
     }
     renderTabs();
     scheduleBvhBuild(tab);
     requestRender();
   } catch (e) {
-    if (tab.closed) return; // closed while loading (job cancelled)
+    if (tab.closed) return tab; // closed while loading (job cancelled)
     console.error(e);
+    tab.loadError = e.message;
     toast(`${name}: ${e.message}`, true);
     closeTab(tab);
   } finally {
     clearInterval(timer);
   }
+  return tab; // closed (and loadError set) when it failed
 }
 
 
@@ -482,8 +508,8 @@ function buildModel(tab, result) {
     mesh.visible = !m.hidden;
     const part = {
       id: i, name: m.name || '', mesh, material: mat, baseColor: mat.color.clone(), rgb, hasVertexColors: !!m.colors,
-      visible: !m.hidden, opacity: 1, edges: m.edges, faceFirst: m.faceFirst, faceLast: m.faceLast,
-      triCount: m.index.length / 3, box: geo.boundingBox.clone(), node: null, adj: null,
+      visible: !m.hidden, opacity: m.opacity >= 0 && m.opacity < 1 ? m.opacity : 1, edges: m.edges, faceFirst: m.faceFirst, faceLast: m.faceLast,
+      triCount: m.index.length / 3, box: geo.boundingBox.clone(), node: null, adj: null, link: m.link || null,
     };
     mesh.userData.part = part;
     tab.triCount += part.triCount;
@@ -491,6 +517,8 @@ function buildModel(tab, result) {
     parts.push(part);
   });
   tab.parts = parts;
+  if (result.robot) setupRobot(tab, result.robot, (result.warnings ||= []));
+  for (const p of parts) if (p.opacity < 1) applyPart(tab, p);
 
   // tree
   const nodes = [];
@@ -566,6 +594,297 @@ function ensureBvh(p) {
   if (!g.boundsTree) g.computeBoundsTree({ indirect: true, targetLeafSize: 12 });
 }
 
+// ---------------------------------------------------------------- URDF robots: joints move their links
+// The geometry stays in world coordinates, as for every other file (picking, snapping, sections, faces and DXF
+// read it directly): each part keeps a copy in its link's frame and is placed again whenever a joint above it moves.
+const JOINT_KIND = { revolute: '회전', continuous: '연속 회전', prismatic: '직선' };
+const _jMot = new THREE.Matrix4(), _jT = new THREE.Vector3();
+function setupRobot(tab, r, warnings = []) {
+  const links = new Map(r.links.map((n) => [n, { name: n, parts: [], world: new THREE.Matrix4(), placed: null }]));
+  const joints = r.joints.map((j) => ({
+    ...j, origin: new THREE.Matrix4().fromArray(j.origin), axis: new THREE.Vector3().fromArray(j.axis).normalize(),
+    // home (set below): 0 = the URDF's zero pose, unless the limits exclude it: then the nearest limit
+    home: 0, value: 0, master: null,
+  }));
+  const byName = new Map(joints.map((j) => [j.name, j]));
+  for (const j of joints) { j.followers = []; if (j.mimic) j.master = byName.get(j.mimic.joint) || null; }
+  // a master may only go where all of its mimic followers stay inside their own limits:
+  // follower = a·q + b along the chain -> q range; the intersection is the master's usable range
+  for (const f of joints) {
+    if (!f.master || f.type === 'continuous') continue;
+    let a = 1, b = 0, m = f;
+    // f = a·x + b with x = value of m; m = k·y + c (its master y)  ->  f = (a·k)·y + (a·c + b)
+    while (m.master) { b += a * m.mimic.offset; a *= m.mimic.multiplier; m = m.master; }
+    if (a === 0) { // multiplier 0: the follower is the constant b, whatever the master does
+      if (b < f.lower - 1e-12 || b > f.upper + 1e-12) warnings.push(`joint "${f.name}": mimic 값이 상수 ${b}로 자체 한계 밖입니다. 한계에 맞춰 표시합니다.`);
+      continue;
+    }
+    const q1 = (f.lower - b) / a, q2 = (f.upper - b) / a;
+    m.followers.push({ f, lo: Math.min(q1, q2), hi: Math.max(q1, q2) });
+  }
+  for (const j of joints) {
+    if (j.master || !j.followers.length) { j.mlo = j.lower; j.mhi = j.upper; continue; }
+    const lo = Math.max(j.type === 'continuous' ? -Infinity : j.lower, ...j.followers.map((x) => x.lo));
+    const hi = Math.min(j.type === 'continuous' ? Infinity : j.upper, ...j.followers.map((x) => x.hi));
+    if (lo > hi) { // no common range (exactly: an inverted range must never be used)
+      warnings.push(`joint "${j.name}": mimic 관절(${j.followers.map((x) => x.f.name).join(', ')})의 한계와 맞는 범위가 없습니다. 자체 한계만 사용합니다.`);
+      j.mlo = j.lower; j.mhi = j.upper;
+    } else { j.mlo = Number.isFinite(lo) ? lo : j.lower; j.mhi = Number.isFinite(hi) ? hi : j.upper; }
+  }
+  for (const j of joints) j.value = j.home = j.type === 'fixed' ? 0 : Math.min(Math.max(0, j.mlo), j.mhi);
+  for (const p of tab.parts) {
+    const l = links.get(p.link);
+    if (!l) continue;
+    l.parts.push(p);
+    const g = p.mesh.geometry, n = g.getAttribute('normal');
+    p.local = { pos: g.getAttribute('position').array.slice(), nrm: n ? n.array.slice() : null, edges: p.edges.slice() };
+  }
+  tab.robot = {
+    name: r.name, links, joints, byName, free: false, scheduled: false, axisJoint: null, panelOpen: true,
+    ui: joints.filter((j) => j.type !== 'fixed').sort((a, b) => a.decl - b.decl),
+  };
+  poseRobot(tab, true);
+}
+/** effective joint value: mimic joints follow their master (chains are resolved; cycles were removed by the reader)
+ *  and stop at their own limits unless the limits are lifted */
+function jointValue(j, R) {
+  if (!j.master) return j.value;
+  const v = jointValue(j.master, R) * j.mimic.multiplier + j.mimic.offset;
+  return R.free || j.type === 'continuous' ? v : Math.min(Math.max(v, j.lower), j.upper);
+}
+function jointMotion(j, q, out) {
+  if (j.type === 'revolute' || j.type === 'continuous') return out.makeRotationAxis(j.axis, q);
+  if (j.type === 'prismatic') { _jT.copy(j.axis).multiplyScalar(q * 1000); return out.makeTranslation(_jT.x, _jT.y, _jT.z); }
+  return out.identity();
+}
+/** rigid placement of a part: link-frame copy -> world (positions, normals, CAD edges), then bounds and BVH */
+function placePart(p, M) {
+  const g = p.mesh.geometry, e = M.elements;
+  const xf = (src, dst, w) => {
+    for (let i = 0; i < src.length; i += 3) {
+      const x = src[i], y = src[i + 1], z = src[i + 2];
+      dst[i] = e[0] * x + e[4] * y + e[8] * z + w * e[12];
+      dst[i + 1] = e[1] * x + e[5] * y + e[9] * z + w * e[13];
+      dst[i + 2] = e[2] * x + e[6] * y + e[10] * z + w * e[14];
+    }
+  };
+  const pa = g.getAttribute('position');
+  xf(p.local.pos, pa.array, 1); pa.needsUpdate = true;
+  const na = g.getAttribute('normal');
+  if (na && p.local.nrm) { xf(p.local.nrm, na.array, 0); na.needsUpdate = true; }
+  xf(p.local.edges, p.edges, 1);
+  g.computeBoundingBox(); g.computeBoundingSphere();
+  p.box.copy(g.boundingBox);
+  p.poseVer = (p.poseVer || 0) + 1; // invalidates cached section contours
+  if (g.boundsTree) g.boundsTree.refit();
+  p.adj = null; // CAD-edge adjacency is keyed by position
+  disposeFaceCache(p);
+}
+/** forward kinematics; re-places the links whose pose changed. Returns the moved parts. */
+function poseRobot(tab, initial = false) {
+  const R = tab.robot;
+  for (const l of R.links.values()) l.world.identity(); // roots stay at the origin
+  for (const j of R.joints) { // breadth-first: the parent link is placed before its children
+    R.links.get(j.child).world.multiplyMatrices(R.links.get(j.parent).world, j.origin).multiply(jointMotion(j, jointValue(j, R), _jMot));
+  }
+  const moved = [];
+  for (const l of R.links.values()) {
+    if (l.placed && l.placed.equals(l.world)) continue;
+    l.placed = l.world.clone();
+    for (const p of l.parts) { placePart(p, l.world); moved.push(p); }
+  }
+  if (initial || !moved.length) return moved;
+  const ms = new Set(moved);
+  tab.box.makeEmpty();
+  for (const p of tab.parts) tab.box.union(p.box);
+  updatePartEdges(tab, moved);
+  // a picked-face section keeps its position; its slider range follows the model (also while it is off)
+  const c = tab.section.c;
+  if (c.normal) { const [lo, hi] = boxRangeAlong(tab, c.normal); c.min = Math.min(lo, c.pos); c.max = Math.max(hi, c.pos); }
+  if (tab.clipPlanes.length) { // caps, planes and slider ranges follow
+    applySection(tab, true);
+    if (active === tab) syncSectionUI();
+  }
+  // picked faces / edges / vertices of a moved part are stale
+  if (tab.entities && tab.entities.some((x) => ms.has(x.part))) setEntities(tab, tab.entities.filter((x) => !ms.has(x.part)));
+  if (active === tab && [...tab.selection].some((p) => ms.has(p))) updateProps();
+  if (R.axisJoint) showJointAxis(tab, R.axisJoint);
+  requestRender();
+  return moved;
+}
+function schedulePose(tab) {
+  const R = tab.robot;
+  if (R.scheduled) return;
+  R.scheduled = true;
+  requestAnimationFrame(() => {
+    R.scheduled = false;
+    if (tab.closed) return;
+    poseRobot(tab);
+    if (active === tab) syncJointValues();
+  });
+}
+function jointRange(R, j) {
+  if (!R.free) return [j.mlo, j.mhi]; // own limits, narrowed by mimic followers
+  if (j.type === 'continuous') return [j.lower, j.upper];
+  if (j.type === 'prismatic') { const s = Math.max(j.upper - j.lower, 0.01); return [j.lower - s, j.upper + s]; }
+  return [Math.min(j.lower, -Math.PI), Math.max(j.upper, Math.PI)];
+}
+const jointToDisp = (j, v) => (j.type === 'prismatic' ? v * 1000 : THREE.MathUtils.radToDeg(v)); // mm / °
+const jointFromDisp = (j, v) => (j.type === 'prismatic' ? v / 1000 : THREE.MathUtils.degToRad(v));
+const jointUnit = (j) => (j.type === 'prismatic' ? 'mm' : '°');
+function setJoint(tab, j, v) {
+  const R = tab.robot;
+  const [lo, hi] = jointRange(R, j);
+  if (!Number.isFinite(v)) return;
+  // a continuous joint turns without end (the number box takes any angle) unless mimic followers bound it
+  j.value = j.type === 'continuous' && (R.free || !j.followers.length) ? v : Math.min(Math.max(v, lo), hi);
+  schedulePose(tab);
+}
+/** the joint axis (through the joint origin) drawn while its row is hovered or dragged */
+const jointAxisMat = { line: new THREE.LineBasicMaterial({ color: 0xff5f9e, depthTest: false, transparent: true }),
+  cone: new THREE.MeshBasicMaterial({ color: 0xff5f9e, depthTest: false, transparent: true }) };
+function showJointAxis(tab, j) {
+  const R = tab.robot;
+  R.axisJoint = j;
+  let a = tab.jointAxisObj;
+  if (!a && j) { // one arrow per tab, reused (ArrowHelper's geometries are shared module-wide: never disposed)
+    a = tab.jointAxisObj = new THREE.ArrowHelper();
+    a.line.material.dispose(); a.cone.material.dispose();
+    a.line.material = jointAxisMat.line; a.cone.material = jointAxisMat.cone;
+    a.line.renderOrder = a.cone.renderOrder = 10;
+    a.traverse((o2) => { o2.raycast = () => {}; });
+    tab.overlay.add(a);
+  }
+  if (a) a.visible = !!j;
+  if (j) {
+    const F = new THREE.Matrix4().multiplyMatrices(R.links.get(j.parent).world, j.origin); // joint frame
+    const o = new THREE.Vector3().setFromMatrixPosition(F), d = j.axis.clone().transformDirection(F);
+    const len = tab.diag * 0.18;
+    a.position.copy(o).addScaledVector(d, -len * 0.5);
+    a.setDirection(d);
+    a.setLength(len, len * 0.18, len * 0.08);
+  }
+  requestRender();
+}
+
+function syncJointUI(fromLoad = false) {
+  const tab = active, R = tab && !tab.loading ? tab.robot : null;
+  $('btnJoints').classList.toggle('hidden', !R);
+  const panel = $('jointPanel');
+  if (!R) panel.classList.add('hidden');
+  else {
+    if (fromLoad && COMPACT.matches) toggleSectionPanel(false);
+    panel.classList.toggle('hidden', !R.panelOpen);
+    renderJointPanel();
+  }
+  $('btnJoints').classList.toggle('active', !!R && !panel.classList.contains('hidden'));
+}
+function toggleJointPanel(force) {
+  const R = active && !active.loading && active.robot;
+  if (!R) return;
+  R.panelOpen = force ?? !R.panelOpen;
+  if (R.panelOpen && COMPACT.matches) toggleSectionPanel(false); // phones: one sheet at the top
+  if (!R.panelOpen) showJointAxis(active, null);
+  syncJointUI();
+}
+function renderJointPanel() {
+  const tab = active, R = tab && tab.robot;
+  const el = $('jointList');
+  el.innerHTML = '';
+  if (!R) return;
+  $('jointFree').checked = R.free;
+  $('jointTitle').textContent = `관절 (${R.ui.length})`;
+  if (!R.ui.length) { el.innerHTML = '<div class="hint">움직일 수 있는 관절이 없습니다.</div>'; return; }
+  const d1 = (v) => fmt(v, 1);
+  for (const j of R.ui) {
+    const [lo, hi] = jointRange(R, j);
+    const lim = j.type === 'continuous' ? '제한 없음' : `${d1(jointToDisp(j, j.lower))} … ${d1(jointToDisp(j, j.upper))} ${jointUnit(j)}${j.hasLimit ? '' : ' (URDF에 없음)'}`;
+    const tip = [`${j.name} · ${JOINT_KIND[j.type]} 관절`, `${j.parent} → ${j.child}`, `축 (${j.axis.toArray().map((x) => fmt(x, 3)).join(', ')})`, `한계 ${lim}`];
+    if (Math.abs(j.mlo - j.lower) > 1e-12 || Math.abs(j.mhi - j.upper) > 1e-12) tip.push(`사용 범위 ${d1(jointToDisp(j, j.mlo))} … ${d1(jointToDisp(j, j.mhi))} ${jointUnit(j)} (mimic 관절 ${j.followers.map((x) => x.f.name).join(', ')}의 한계)`);
+    if (j.master) tip.push(`mimic: ${j.master.name} × ${j.mimic.multiplier}${j.mimic.offset ? ` + ${d1(jointToDisp(j, j.mimic.offset))}${jointUnit(j)}` : ''}`);
+    tip.push('이름 클릭: 이 관절이 움직이는 부품 선택');
+    const row = document.createElement('div');
+    row.className = 'jrow' + (j.master ? ' mimic' : '');
+    row.dataset.j = j.name;
+    row.title = tip.join('\n');
+    const step = j.type === 'prismatic' ? 0.01 : 0.1;
+    const dis = j.master ? ' disabled' : '';
+    row.innerHTML = `<span class="jname">${escapeHtml(j.name)}</span>` +
+      `<input type="range" class="jpos" min="${jointToDisp(j, lo)}" max="${jointToDisp(j, hi)}" step="any"${dis} aria-label="${escapeHtml(j.name)}">` +
+      `<input type="number" class="jnum" step="${step}"${j.type === 'continuous' ? '' : ` min="${jointToDisp(j, lo)}" max="${jointToDisp(j, hi)}"`}${dis}>` +
+      `<span class="junit">${jointUnit(j)}</span>`;
+    el.appendChild(row);
+  }
+  syncJointValues();
+}
+function syncJointValues() {
+  const R = active && active.robot;
+  if (!R) return;
+  for (const row of $('jointList').querySelectorAll('.jrow')) {
+    const j = R.byName.get(row.dataset.j);
+    const v = jointToDisp(j, jointValue(j, R));
+    row.querySelector('.jpos').value = String(v);
+    const num = row.querySelector('.jnum');
+    if (document.activeElement !== num) num.value = fmt(v, j.type === 'prismatic' ? 2 : 1);
+  }
+}
+const jointOfRow = (el) => { const row = el.closest && el.closest('.jrow'); return row && active && active.robot ? active.robot.byName.get(row.dataset.j) : null; };
+$('jointList').addEventListener('input', (e) => {
+  const j = jointOfRow(e.target);
+  if (!j || !e.target.classList.contains('jpos')) return;
+  setJoint(active, j, jointFromDisp(j, Number(e.target.value)));
+});
+$('jointList').addEventListener('change', (e) => {
+  const j = jointOfRow(e.target);
+  if (!j || !e.target.classList.contains('jnum')) return;
+  const v = Number(e.target.value);
+  if (e.target.value.trim() !== '' && Number.isFinite(v)) setJoint(active, j, jointFromDisp(j, v));
+  syncJointValues();
+});
+$('jointList').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.classList.contains('jnum')) e.target.blur(); });
+$('jointList').addEventListener('focusout', () => setTimeout(syncJointValues));
+// clicking a joint's name selects what it moves (the child link and everything below it)
+$('jointList').addEventListener('click', (e) => {
+  const j = jointOfRow(e.target);
+  if (!j || !e.target.classList.contains('jname')) return;
+  const tab = active, R = tab.robot;
+  // the joint and every mimic joint that follows it (directly or through a chain), with all links below them
+  const drives = (k) => { for (let m = k; m; m = m.master) if (m === j) return true; return false; };
+  const below = new Set(R.joints.filter(drives).map((k) => k.child));
+  for (const k of R.joints) if (below.has(k.parent)) below.add(k.child); // breadth-first order: one pass
+  const list = tab.parts.filter((p) => below.has(p.link) && p.visible);
+  selectParts(list);
+  if (list[0]) revealPart(tab, list[0]);
+});
+// the axis shows while a row is hovered, dragged or focused from the keyboard
+let jointDrag = false;
+const jointListHovered = () => $('jointList').matches(':hover');
+$('jointList').addEventListener('pointerover', (e) => { const j = jointOfRow(e.target); if (j && !jointDrag && active.robot.axisJoint !== j) showJointAxis(active, j); });
+$('jointList').addEventListener('pointerdown', (e) => { if (e.target.classList.contains('jpos')) jointDrag = true; });
+window.addEventListener('pointerup', () => {
+  if (!jointDrag) return;
+  jointDrag = false;
+  if (active && active.robot && !jointListHovered()) showJointAxis(active, null);
+});
+$('jointList').addEventListener('pointerleave', () => { if (!jointDrag && active && active.robot) showJointAxis(active, null); });
+$('jointList').addEventListener('focusin', (e) => { const j = jointOfRow(e.target); if (j && e.target.matches(':focus-visible')) showJointAxis(active, j); });
+$('jointList').addEventListener('focusout', (e) => { if (active && active.robot && !jointDrag && !jointListHovered() && !$('jointList').contains(e.relatedTarget)) showJointAxis(active, null); });
+$('jointFree').onchange = (e) => {
+  const tab = active, R = tab && tab.robot;
+  if (!R) return;
+  R.free = e.target.checked;
+  if (!R.free) for (const j of R.ui) if (!j.master) setJoint(tab, j, j.value); // same rule as typing a value
+  renderJointPanel();
+  schedulePose(tab);
+};
+$('btnJointHome').onclick = () => {
+  const tab = active, R = tab && tab.robot;
+  if (!R) return;
+  for (const j of R.joints) j.value = j.home;
+  schedulePose(tab);
+};
+$('btnJoints').onclick = () => toggleJointPanel();
+
 // ---------------------------------------------------------------- materials / visibility
 let colorEditing = false;
 function effOpacity(tab, p) { return p.opacity * tab.globalOpacity; }
@@ -594,6 +913,7 @@ function refreshParts(tab, list = tab.parts) {
 function rebuildEdges(tab) {
   for (const e of tab.edgeObjs) { e.removeFromParent(); e.geometry.dispose(); e.material.dispose(); }
   tab.edgeObjs = [];
+  tab.edgeSlots = new Map(); // part -> where its edges sit in the merged buffers (moved robot links update in place)
   tab.edgeDirty = false;
   if (!tab.showEdges) return;
   // one merged draw call per opacity bin (bin 10 = opaque)
@@ -608,10 +928,11 @@ function rebuildEdges(tab) {
     let total = 0;
     for (const p of list) total += p.edges.length;
     const arr = new Float32Array(total);
+    const attr = new THREE.BufferAttribute(arr, 3);
     let o = 0;
-    for (const p of list) { arr.set(p.edges, o); o += p.edges.length; }
+    for (const p of list) { arr.set(p.edges, o); tab.edgeSlots.set(p, { attr, off: o }); o += p.edges.length; }
     const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+    g.setAttribute('position', attr);
     const mat = new THREE.LineBasicMaterial({ color: 0x14171c, clippingPlanes: tab.clipPlanes });
     if (gi < 10) { mat.transparent = true; mat.opacity = Math.max(0.06, (gi / 10) * 0.6); mat.depthWrite = false; }
     const ls = new THREE.LineSegments(g, mat);
@@ -621,6 +942,17 @@ function rebuildEdges(tab) {
     tab.scene.add(ls);
     tab.edgeObjs.push(ls);
   });
+}
+/** moved parts' CAD edges -> their slots in the merged buffers (only those ranges are uploaded again) */
+function updatePartEdges(tab, parts) {
+  if (tab.edgeDirty || !tab.edgeSlots) { tab.edgeDirty = true; return; }
+  for (const p of parts) {
+    const s = tab.edgeSlots.get(p);
+    if (!s) continue; // hidden, or no edges
+    s.attr.array.set(p.edges, s.off);
+    s.attr.addUpdateRange(s.off, p.edges.length);
+    s.attr.needsUpdate = true;
+  }
 }
 
 // ---------------------------------------------------------------- camera / views
@@ -2009,10 +2341,33 @@ function autoFlip(tab, ax) {
   return tab.camera.position[ax] < tab.box.getCenter(new THREE.Vector3())[ax];
 }
 
+/** section lines of the parts on a plane; per part cached for its current placement (robot joints moving one link
+ *  must not recut all the others) */
 function sectionContour(tab, plane, parts) {
+  const pieces = [];
+  const key = `${plane.normal.x},${plane.normal.y},${plane.normal.z},${plane.constant}`;
+  let total = 0;
+  for (const p of parts) {
+    const ver = p.poseVer || 0;
+    if (!p.secCache || p.secCache.ver !== ver) p.secCache = { ver, map: new Map() };
+    let arr = p.secCache.map.get(key);
+    if (!arr) {
+      if (p.secCache.map.size >= 8) p.secCache.map.delete(p.secCache.map.keys().next().value);
+      arr = partContour(p, plane);
+      p.secCache.map.set(key, arr);
+    }
+    pieces.push(arr);
+    total += arr.length;
+  }
+  const out = new Float32Array(total);
+  let o = 0;
+  for (const a of pieces) { out.set(a, o); o += a.length; }
+  return out;
+}
+function partContour(p, plane) {
   const out = [];
   const n = plane.normal, c = plane.constant;
-  for (const p of parts) {
+  {
     const g = p.mesh.geometry;
     const pos = g.getAttribute('position').array, idx = g.getIndex().array;
     for (let t = 0; t < idx.length; t += 3) {
@@ -2060,7 +2415,9 @@ function makeCap(tab, plane, others) {
     stencilWrite: true, stencilRef: 0, stencilFunc: THREE.NotEqualStencilFunc,
     stencilFail: THREE.ReplaceStencilOp, stencilZFail: THREE.ReplaceStencilOp, stencilZPass: THREE.ReplaceStencilOp });
   const center = tab.box.getCenter(new THREE.Vector3());
-  const geo = new THREE.PlaneGeometry(tab.diag * 2.2, tab.diag * 2.2);
+  // the box can outgrow the size at load (robot joints): the cap must still cover it
+  const reach = Math.max(tab.diag, tab.box.getSize(new THREE.Vector3()).length());
+  const geo = new THREE.PlaneGeometry(reach * 2.2, reach * 2.2);
   const mesh = new THREE.Mesh(geo, capMat);
   plane.projectPoint(center, mesh.position);
   mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), plane.normal);
@@ -2092,7 +2449,8 @@ function makeCap(tab, plane, others) {
   return { plane, backMat, frontMat, capMat, mesh, scene, bins };
 }
 
-function applySection(tab) {
+/** @param keepEdges the planes moved but their number did not (robot joints): the merged CAD-edge buffers stay */
+function applySection(tab, keepEdges = false) {
   const s = tab.section;
   tab.clipPlanes.length = 0;
   disposeSectionObjs(tab);
@@ -2123,7 +2481,7 @@ function applySection(tab) {
   if (s.caps) {
     tab.caps = tab.clipPlanes.map((pl) => makeCap(tab, pl, tab.clipPlanes.filter((o) => o !== pl)));
   }
-  tab.edgeDirty = true;
+  if (!keepEdges) tab.edgeDirty = true;
   requestRender();
 }
 const planeFillMat = new THREE.MeshBasicMaterial({ color: 0x3d8bfd, transparent: true, opacity: 0.07, side: THREE.DoubleSide, depthWrite: false });
@@ -2188,7 +2546,10 @@ function toggleSectionPanel(force) {
   p.classList.toggle('hidden', !show);
   syncSectionUI();
 }
-$('btnSection').onclick = () => toggleSectionPanel();
+$('btnSection').onclick = () => {
+  toggleSectionPanel();
+  if (COMPACT.matches && active?.robot?.panelOpen && !$('sectionPanel').classList.contains('hidden')) toggleJointPanel(false); // phones: one sheet at the top
+};
 
 /** section plane under the cursor (select mode, section panel open, planes shown) that is not hidden
  *  behind a model surface -> { ax, n, point, t } */
@@ -2255,10 +2616,8 @@ function endPlaneDrag(e) {
   return true;
 }
 
-function pickPlaneFromHit(tab, hit) {
-  const n = hit.normal.clone().normalize();
-  const s = tab.section.c;
-  // projection range of the model box onto n
+/** projection range of the model box onto n (slider range of a section on a picked face) */
+function boxRangeAlong(tab, n) {
   let lo = Infinity, hi = -Infinity;
   const b = tab.box;
   for (let i = 0; i < 8; i++) {
@@ -2267,7 +2626,13 @@ function pickPlaneFromHit(tab, hit) {
     lo = Math.min(lo, d); hi = Math.max(hi, d);
   }
   const pad = tab.diag * 0.005;
-  Object.assign(s, { on: true, normal: n, min: lo - pad, max: hi + pad, pos: hit.point.dot(n) - tab.diag * 0.002, flip: false });
+  return [lo - pad, hi + pad];
+}
+function pickPlaneFromHit(tab, hit) {
+  const n = hit.normal.clone().normalize();
+  const s = tab.section.c;
+  const [min, max] = boxRangeAlong(tab, n);
+  Object.assign(s, { on: true, normal: n, min, max, pos: hit.point.dot(n) - tab.diag * 0.002, flip: false });
   applySection(tab);
   toggleSectionPanel(true);
   setMode('select');
@@ -2580,7 +2945,10 @@ function updateStatus() {
 }
 
 let toastTimer = null;
+const toastLog = []; // recent messages (automation results report the ones shown while a command ran)
 function toast(msg, err = false) {
+  toastLog.push({ t: performance.now(), msg, err });
+  if (toastLog.length > 50) toastLog.shift();
   const t = $('toast');
   t.textContent = msg;
   t.classList.toggle('err', err);
@@ -2751,7 +3119,7 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && document.body.classList.contains('drawer-open')) { setDrawer(false); return; }
   if (e.target.tagName === 'INPUT' && e.target.type !== 'range' && e.target.type !== 'checkbox' && e.target.type !== 'color' || e.target.tagName === 'SELECT') return;
   const k = e.key.toLowerCase();
-  if (e.ctrlKey && k === 'o') { e.preventDefault(); $('fileInput').click(); return; }
+  if (e.ctrlKey && k === 'o') { e.preventDefault(); openDialog(); return; }
   if (e.ctrlKey && k === 'w') { e.preventDefault(); if (active) closeTab(active); return; }
   if (e.ctrlKey && e.key === 'Tab') {
     e.preventDefault();
@@ -2787,7 +3155,8 @@ window.addEventListener('keydown', (e) => {
     case 'a': setMode('angle'); break;
     case 'r': setMode('radius'); break;
     case 'g': setMode('face'); break;
-    case 'x': toggleSectionPanel(); break;
+    case 'x': $('btnSection').click(); break;
+    case 'j': if (!active.robot) return; toggleJointPanel(); break;
     case 'e': $('btnEdges').click(); break;
     case 'o': $('btnOrigin').click(); break;
     case 'p': toggleProjection(); break;
@@ -2811,8 +3180,88 @@ window.addEventListener('keydown', (e) => {
 });
 
 // ---------------------------------------------------------------- files: button, drag & drop, server push
-$('btnOpen').onclick = () => $('fileInput').click();
-$('btnOpen2').onclick = () => $('fileInput').click();
+/** files the local server can read by path (command line, Explorer, native dialog, MCP). References (assembly parts,
+ *  URDF meshes) come from next to the file or from the files given together.
+ *  @param group true for a pick (open dialog, MCP): files picked together with an assembly/URDF only serve as its
+ *  references, like a drop. false (command line, Explorer "Open"): every file gets its own tab, as before. */
+function openServerFiles(list, group = true) {
+  const hasUrdf = group && list.some((f) => isUrdf(f.name)), hasAsm = group && list.some((f) => isAsm(f.name));
+  const isRef = (f) => (hasUrdf && MESH_REF.test(f.name)) || (hasAsm && !isAsm(f.name) && !isUrdf(f.name) && !MESH_REF.test(f.name));
+  const refs = list.filter(isRef).length;
+  if (refs) toast(`${hasUrdf && hasAsm ? 'URDF·조립품' : hasUrdf ? 'URDF' : '조립품'}과 함께 고른 파일 ${refs}개는 참조용으로만 사용합니다.`);
+  return list.filter((x) => !isRef(x)).map((f) => {
+    // closing the tab (by the user, or a cancelled automation command) stops its downloads too
+    const ctl = new AbortController(), signal = ctl.signal;
+    const get = (u) => fetch(u, { signal });
+    return loadBuffer(f.name, async (tab) => {
+      tab.abortLoad = () => ctl.abort();
+      if (f.dir) tab.srcDir = f.dir;
+      const r = await get(`/api/file/${f.id}`);
+      if (!r.ok) throw new Error(`파일을 읽을 수 없습니다 (${r.status})`);
+      return r.arrayBuffer();
+    }, f.size, async (want) => {
+      if (signal.aborted) return null;
+      const sibling = async (only) => {
+        const r = await get(`/api/sibling/${f.id}?name=${encodeURIComponent(want)}&only=${only}`);
+        return r.status === 200 ? r.arrayBuffer() : null;
+      };
+      // 1. exactly what the reference names, next to the opened file (package:// and relative paths resolved)
+      const exact = await sibling('exact');
+      if (exact) return exact;
+      // 2. the files chosen together (they may sit in a folder the lookup never searches)
+      const hit = pickedRef(list, f, want);
+      if (hit) {
+        const h = await get(`/api/file/${hit.id}`);
+        if (h.ok) return h.arrayBuffer();
+      }
+      // 3. only then a file that merely has the same (or a suffixed) name next to the opened one
+      return sibling('fallback');
+    });
+  });
+}
+/** the file chosen together with `owner` that a reference means: same name (see matchRefName); among several,
+ *  the one whose path ends with most of the reference path (package://pkg/meshes/x.stl), then the owner's folder */
+function pickedRef(list, owner, want) {
+  const cands = list.filter((f) => f !== owner && matchRefName([f.name], want));
+  if (cands.length < 2) return cands[0] || null;
+  const segs = (s) => s.replace(/^package:\/\//i, '').replace(/\\/g, '/').toLowerCase().split('/').filter(Boolean);
+  const ref = segs(want);
+  const score = (f) => {
+    const p = segs(`${f.dir || ''}/${f.name}`);
+    let k = 0;
+    while (k < ref.length && k < p.length && ref[ref.length - 1 - k] === p[p.length - 1 - k]) k++;
+    return k * 2 + (f.dir === owner.dir ? 1 : 0);
+  };
+  const ranked = cands.map((f) => [score(f), f]).sort((a, b) => b[0] - a[0]);
+  if (ranked[0][0] === ranked[1][0]) {
+    toast(`${owner.name}: '${refBase(want)}'에 맞는 파일이 여러 개입니다. 경로가 가장 가까운 첫 번째 파일을 사용합니다.`, true);
+  }
+  return ranked[0][1];
+}
+/** '열기': the desktop app shows the Windows dialog (real paths -> referenced files are found next to the
+ *  chosen one); the web version, or a failed dialog, falls back to the browser's file input */
+let pickBusy = false, nativePickFailed = false;
+async function openDialog() {
+  // the browser picker only opens right inside a click: after a failed round trip it may be blocked, so a
+  // failure makes the next click (only that one) open the browser picker; the click after tries Windows again
+  if (!LOCAL_SERVER || nativePickFailed) { nativePickFailed = false; $('fileInput').click(); return; }
+  if (pickBusy) return;
+  pickBusy = true;
+  try {
+    const res = await fetch('/api/pick-files', { method: 'POST', cache: 'no-store', headers: { 'X-StepViewer': '1' } });
+    if (!res.ok) throw new Error(String(res.status));
+    const r = await res.json();
+    if (r.busy) { toast('파일 선택 창이 이미 열려 있습니다.'); return; }
+    if (r.unavailable) throw new Error('unavailable');
+    for (const n of r.skipped || []) toast(`지원하지 않는 형식: ${n}`, true);
+    if (r.files && r.files.length) openServerFiles(r.files);
+  } catch {
+    nativePickFailed = true;
+    toast('Windows 파일 선택 창을 열지 못했습니다. 다시 누르면 브라우저 파일 선택 창이 열립니다 (메시·부품 파일은 함께 선택하세요).', true);
+  } finally { pickBusy = false; }
+}
+$('btnOpen').onclick = () => openDialog();
+$('btnOpen2').onclick = () => openDialog();
 $('fileInput').onchange = (e) => { openFiles([...e.target.files]); e.target.value = ''; };
 let dragDepth = 0;
 window.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; $('dropOverlay').classList.remove('hidden'); });
@@ -2991,21 +3440,209 @@ function connectServer() {
       else if (h.version !== bootVersion) location.href = '/';
     } catch { /* ignore */ }
   });
-  es.addEventListener('openfiles', (ev) => {
-    for (const f of JSON.parse(ev.data)) {
-      loadBuffer(f.name, async (tab) => {
-        if (f.dir) tab.srcDir = f.dir;
-        const r = await fetch(`/api/file/${f.id}`);
-        if (!r.ok) throw new Error(`파일을 읽을 수 없습니다 (${r.status})`);
-        return r.arrayBuffer();
-      }, f.size, async (want) => { // files next to the opened one (assembly references)
-        const r = await fetch(`/api/sibling/${f.id}?name=${encodeURIComponent(want)}`);
-        return r.status === 200 ? r.arrayBuffer() : null;
-      });
-    }
-  });
+  es.addEventListener('openfiles', (ev) => openServerFiles(JSON.parse(ev.data), false)); // command line / Explorer: a tab each
   es.addEventListener('focus', () => window.focus());
+  // automation (MCP): the server sends a command to the window used last, the result goes back by POST
+  const running = new Map(); // command id -> { cancelled, onCancel: [] }
+  es.addEventListener('rpc-cancel', (ev) => { // the caller gave up: undo what the command started (loading tabs)
+    const run = running.get(JSON.parse(ev.data).id);
+    if (!run || run.cancelled) return;
+    run.cancelled = true;
+    for (const f of run.onCancel) f();
+  });
+  es.addEventListener('rpc', async (ev) => {
+    const { id, cmd, args } = JSON.parse(ev.data);
+    const run = { cancelled: false, onCancel: [] };
+    running.set(id, run);
+    let body;
+    try { body = { id, ok: true, result: await runCommand(cmd, args || {}, run) }; } catch (e) { body = { id, ok: false, error: e && e.message ? e.message : String(e) }; }
+    // the command stays cancellable until the server has taken its result: a cancel that crosses the
+    // result on the way, or a result the server no longer waits for (404), undo it the same way
+    if (!run.cancelled) {
+      let taken = false;
+      try {
+        const r = await fetch('/api/rpc/result', { method: 'POST', cache: 'no-store', headers: { 'X-StepViewer': '1', 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        taken = r.status === 204;
+      } catch { /* server gone */ }
+      if (!taken && !run.cancelled) { run.cancelled = true; for (const f of run.onCancel) f(); }
+    }
+    running.delete(id);
+  });
+  const used = () => { try { navigator.sendBeacon(`/api/active?cid=${cid}`); } catch { /* ignore */ } };
+  window.addEventListener('focus', used);
   window.addEventListener('pagehide', () => { try { navigator.sendBeacon(`/api/bye?cid=${cid}`); } catch { /* ignore */ } });
+}
+
+// ---------------------------------------------------------------- automation commands (MCP, see mcp.js)
+// Everything works without animation frames: a minimized window gets none.
+const r3 = (v) => Math.round(v * 1000) / 1000;
+const boxOut = (b) => (b.isEmpty() ? null : { min: b.min.toArray().map(r3), max: b.max.toArray().map(r3), size: b.getSize(new THREE.Vector3()).toArray().map(r3) });
+function cmdTab(sel, needReady = true) {
+  const none = sel === undefined || sel === null || sel === '';
+  let t;
+  if (none) t = active;
+  else if (typeof sel === 'number') t = tabs[sel];
+  else if (/^#\d+$/.test(String(sel))) t = tabs[Number(String(sel).slice(1))];
+  else t = tabs.find((x) => x.name === sel) || tabs.find((x) => x.name.toLowerCase() === String(sel).toLowerCase());
+  if (!t) throw new Error(none ? '열린 탭이 없습니다.' : `탭을 찾을 수 없습니다: ${sel}`);
+  if (needReady && t.loading) throw new Error(`${t.name}: 아직 불러오는 중입니다.`);
+  if (t !== active) activateTab(t);
+  return t;
+}
+function tabSummary(t) {
+  return { index: tabs.indexOf(t), name: t.name, active: t === active, loading: !!t.loading, parts: t.parts.length, triangles: t.triCount,
+    robot: t.robot ? { name: t.robot.name, joints: t.robot.ui.length } : null, box_mm: t.loading ? null : boxOut(t.box),
+    missing: t.missing || [], loadInfo: t.loadInfo || '' };
+}
+function cmdParts(t, names) {
+  if (!Array.isArray(names) || !names.length) throw new Error('parts: 부품(또는 링크) 이름 목록이 필요합니다.');
+  const out = new Set(), unknown = [];
+  for (const n of names) {
+    const hits = t.parts.filter((p) => p.name === n || p.link === n);
+    if (hits.length) hits.forEach((p) => out.add(p)); else unknown.push(n);
+  }
+  if (unknown.length) throw new Error(`없는 부품/링크: ${unknown.join(', ')}`);
+  return [...out];
+}
+function jointOut(R, j) {
+  const [lo, hi] = jointRange(R, j), d = (v) => r3(jointToDisp(j, v));
+  return { name: j.name, type: j.type, unit: j.type === 'prismatic' ? 'mm' : 'deg', value: d(jointValue(j, R)),
+    limits: j.type === 'continuous' ? null : [d(j.lower), d(j.upper)], range: [d(lo), d(hi)], home: d(j.home),
+    parent: j.parent, child: j.child, axis: j.axis.toArray().map(r3),
+    mimic: j.master ? { joint: j.master.name, multiplier: j.mimic.multiplier, offset: d(j.mimic.offset) } : null };
+}
+function screenshot(t, max) {
+  render(performance.now()); // the drawing buffer is readable until this task ends
+  const w0 = canvas.width, h0 = canvas.height, k = Math.min(1, max / Math.max(w0, h0));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w0 * k)); c.height = Math.max(1, Math.round(h0 * k));
+  const g = c.getContext('2d');
+  const bg = g.createLinearGradient(0, 0, 0, c.height); // the viewport's CSS background (style.css #viewport)
+  bg.addColorStop(0, '#3a4250'); bg.addColorStop(1, '#1d2027');
+  g.fillStyle = bg;
+  g.fillRect(0, 0, c.width, c.height);
+  g.drawImage(canvas, 0, 0, c.width, c.height);
+  // the axis triad (its own canvas), where it is shown
+  const vr = canvas.getBoundingClientRect(), tr = triad.getBoundingClientRect(), sx = c.width / (vr.width || 1);
+  if (tr.width) g.drawImage(triad, (tr.left - vr.left) * sx, (tr.top - vr.top) * sx, tr.width * sx, tr.height * sx);
+  requestRender();
+  return { png: c.toDataURL('image/png').split(',')[1], width: c.width, height: c.height, tab: t.name };
+}
+async function runCommand(cmd, a, run = { cancelled: false, onCancel: [] }) {
+  const since = performance.now();
+  const messages = () => toastLog.filter((m) => m.t >= since).map((m) => (m.err ? '⚠ ' : '') + m.msg);
+  switch (cmd) {
+    case 'status':
+      return { tabs: tabs.map(tabSummary), active: active ? tabs.indexOf(active) : null, quality: $('quality').value };
+    case 'open': { // files registered by the server (paths checked there)
+      const before = new Set(tabs);
+      const pending = openServerFiles(a.files || []); // each load creates its tab right away
+      const mine = tabs.filter((t) => !before.has(t));
+      run.onCancel.push(() => { for (const t of mine) if (!t.closed) closeTab(t); }); // cancelled: its tabs go (loading or not)
+      const loads = await Promise.all(pending);
+      return { opened: loads.filter((t) => t && !t.closed).map(tabSummary),
+        failed: loads.filter((t) => t && t.closed && t.loadError).map((t) => ({ name: t.name, error: t.loadError })), messages: messages() };
+    }
+    case 'tab': {
+      if (a.action !== 'activate' && a.action !== 'close') throw new Error("action: 'activate' 또는 'close'");
+      const t = cmdTab(a.tab, false);
+      if (a.action === 'close') { closeTab(t); return { closed: t.name, tabs: tabs.map(tabSummary) }; }
+      return tabSummary(t);
+    }
+    case 'model': {
+      const t = cmdTab(a.tab);
+      const f = a.filter ? String(a.filter).toLowerCase() : '';
+      const list = t.parts.filter((p) => !f || p.name.toLowerCase().includes(f) || (p.link || '').toLowerCase().includes(f));
+      const limit = Math.max(1, Math.min(Number(a.limit) || 200, 2000));
+      return { ...tabSummary(t), matched: list.length, truncated: list.length > limit,
+        parts: list.slice(0, limit).map((p) => ({ name: p.name, link: p.link || undefined, visible: p.visible, selected: t.selection.has(p),
+          triangles: p.triCount, box_mm: boxOut(p.box) })) };
+    }
+    case 'joints': {
+      const t = cmdTab(a.tab);
+      if (!t.robot) throw new Error(`${t.name}: 로봇(URDF) 탭이 아닙니다.`);
+      return { robot: t.robot.name, ignore_limits: t.robot.free, joints: t.robot.ui.map((j) => jointOut(t.robot, j)) };
+    }
+    case 'set_joints': {
+      const t = cmdTab(a.tab), R = t.robot;
+      if (!R) throw new Error(`${t.name}: 로봇(URDF) 탭이 아닙니다.`);
+      const vals = a.values || {};
+      for (const n of Object.keys(vals)) { // check everything before changing anything
+        const j = R.byName.get(n);
+        if (!j || j.type === 'fixed') throw new Error(`움직일 수 있는 관절이 아닙니다: ${n}`);
+        if (j.master) throw new Error(`${n}은(는) mimic 관절입니다 (${j.master.name}을(를) 움직이세요).`);
+        if (typeof vals[n] !== 'number' || !Number.isFinite(vals[n])) throw new Error(`${n}: 숫자가 아닙니다.`);
+      }
+      if (typeof a.ignore_limits === 'boolean' && a.ignore_limits !== R.free) {
+        R.free = a.ignore_limits;
+        if (!R.free) for (const j of R.ui) if (!j.master) setJoint(t, j, j.value); // same rule as the checkbox
+        if (t === active) renderJointPanel();
+      }
+      if (a.reset) for (const j of R.joints) j.value = j.home;
+      const clamped = [];
+      for (const [n, v] of Object.entries(vals)) {
+        const j = R.byName.get(n);
+        if (R.free) j.value = jointFromDisp(j, v); // limits lifted: taken as given (the slider range is only the UI's)
+        else setJoint(t, j, jointFromDisp(j, v));
+        const got = r3(jointToDisp(j, j.value));
+        if (Math.abs(got - v) > 1e-3) clamped.push({ joint: n, requested: v, applied: got });
+      }
+      poseRobot(t);
+      if (t === active) syncJointValues();
+      return { joints: R.ui.map((j) => jointOut(R, j)), clamped, box_mm: boxOut(t.box) };
+    }
+    case 'view': {
+      const t = cmdTab(a.tab);
+      const name = a.view || 'iso';
+      if (name !== 'fit' && !VIEWS[name]) throw new Error(`view: ${Object.keys(VIEWS).join(', ')}, fit 중 하나`);
+      const list = a.parts && a.parts.length ? cmdParts(t, a.parts) : (name === 'fit' && t.selection.size ? [...t.selection] : t.parts);
+      const dir = name === 'fit' ? t.camera.position.clone().sub(t.target).normalize() : new THREE.Vector3(...VIEWS[name]).normalize();
+      syncCameraAspect(t);
+      const f = fitParams(t, visibleBox(t, list), dir);
+      animateCamera(t, f.pos, f.target, f.zoom, 0, name === 'fit' ? null : Z_UP);
+      controls.update();
+      return { view: name, tab: t.name };
+    }
+    case 'visibility': {
+      const t = cmdTab(a.tab);
+      const act = a.action || 'show';
+      if (act === 'all') setVisible(t, t.parts, true);
+      else {
+        const list = cmdParts(t, a.parts);
+        if (act === 'show') setVisible(t, list, true);
+        else if (act === 'hide') setVisible(t, list, false);
+        else if (act === 'only') { const keep = new Set(list); setVisible(t, t.parts.filter((p) => !keep.has(p)), false); setVisible(t, list, true); }
+        else throw new Error('action: show, hide, only, all 중 하나');
+      }
+      return { visible: t.parts.filter((p) => p.visible).length, parts: t.parts.length };
+    }
+    case 'select': {
+      const t = cmdTab(a.tab);
+      selectParts(a.parts && a.parts.length ? cmdParts(t, a.parts) : []);
+      return { selected: [...t.selection].map((p) => p.name) };
+    }
+    case 'section': {
+      const t = cmdTab(a.tab), S = t.section;
+      if (a.axis === 'off') { for (const k of ['x', 'y', 'z', 'c']) S[k].on = false; }
+      else {
+        if (!['x', 'y', 'z'].includes(a.axis)) throw new Error("axis: 'x', 'y', 'z' 또는 'off'");
+        const st = S[a.axis], wasOn = st.on;
+        st.on = a.enabled !== false;
+        if (typeof a.position_mm === 'number' && Number.isFinite(a.position_mm)) st.pos = a.position_mm;
+        if (typeof a.flip === 'boolean') st.flip = a.flip; else if (st.on && !wasOn) st.flip = autoFlip(t, a.axis);
+      }
+      if (typeof a.caps === 'boolean') S.caps = a.caps;
+      applySection(t);
+      syncSectionUI();
+      const ax = (k) => ({ on: S[k].on, position_mm: r3(S[k].pos), flip: S[k].flip, range_mm: axisRange(t, k).map(r3) });
+      return { x: ax('x'), y: ax('y'), z: ax('z'), caps: S.caps };
+    }
+    case 'screenshot': {
+      const t = cmdTab(a.tab);
+      return screenshot(t, Math.max(64, Math.min(Number(a.max_size) || 1280, 4096)));
+    }
+    default: throw new Error(`알 수 없는 명령: ${cmd}`);
+  }
 }
 connectServer();
 
@@ -3186,7 +3823,7 @@ window.__sv = {
     requestRender();
     return tab;
   },
-  snapHit, applySection, sectionHandleAt, fitCylinderFace, workerAssetsReady,
+  snapHit, applySection, sectionHandleAt, fitCylinderFace, workerAssetsReady, poseRobot,
   faceData, describeEntity, setEntities, viewNormalTo, faceOutline, dxfText, openDxfDialog, actionFace, closestBetween, faceFrame, measurePair,
   get persistentGeometries() { let n = 0; originScene.traverse((o) => { if (o.geometry) n++; }); return n; },
   get tabs() { return tabs; }, get active() { return active; }, THREE, renderer, controls, setView, setMode, selectParts, pick, pool,

@@ -77,6 +77,17 @@ input[type=range] { accent-color: var(--acc); }
 
 .floating { position: absolute; right: 8px; top: calc(var(--tb-bottom, 50px) + 8px); width: 320px; background: #1b1e23ee; border: 1px solid var(--line); border-radius: 8px; padding-bottom: 8px; backdrop-filter: blur(4px); }
 #measurePanel { top: auto; bottom: 8px; max-height: 45%; display: flex; flex-direction: column; }
+/* URDF joints: left side, under the toolbar */
+#jointPanel { right: auto; left: 8px; width: 340px; max-height: calc(60% - var(--tb-bottom, 50px)); display: flex; flex-direction: column; }
+.jlist { overflow: auto; padding: 0 8px; min-height: 0; }
+.jrow { display: grid; grid-template-columns: minmax(0, 1fr) 118px 62px 22px; gap: 6px; align-items: center; padding: 2px 4px; border-radius: 4px; }
+.jrow:hover { background: #ffffff0d; }
+.jrow .jname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; font-size: 12px; }
+.jrow .jname:hover { color: #ff9cc4; }
+.jrow input[type=range] { width: 100%; min-width: 0; }
+.jrow input[type=number] { width: 62px; }
+.jrow .junit { color: var(--muted); font-size: 12px; }
+.jrow.mimic .jname { color: var(--muted); font-style: italic; }
 .sec-row { display: grid; grid-template-columns: 46px 1fr 72px 28px; gap: 6px; align-items: center; padding: 3px 8px; }
 .sec-row[data-axis=c] { grid-template-columns: 46px 1fr 72px 28px; }
 .sec-row input[type=number] { width: 72px; }
@@ -240,6 +251,10 @@ body { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
   #sectionPanel .sec-opts { flex-wrap: wrap; gap: 8px 12px; }
   #sectionPanel .sec-flip { height: 34px; }
   #measurePanel, #entityPanel { top: auto; left: 6px; right: 6px; width: auto; bottom: calc(var(--bar-h) + 6px); max-height: 34%; }
+  #jointPanel { left: 6px; right: 6px; width: auto; max-height: 46%; }
+  .jrow { grid-template-columns: minmax(0, 1fr) minmax(90px, 1.3fr) 64px 18px; padding: 4px; }
+  .jrow input[type=range] { height: 30px; }
+  .jrow input[type=number] { width: 64px; height: 30px; }
   /* tap a panel's title to fold it to one line (the model stays reachable) */
   .floating > .panel-head > span:first-child { cursor: pointer; }
   .floating > .panel-head > span:first-child::after { content: " ▾"; color: var(--muted); font-weight: 400; }
