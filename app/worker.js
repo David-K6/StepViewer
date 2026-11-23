@@ -3,8 +3,8 @@
 /* global occtimportjs */
 // When started from a blob (see main.js), the page hands over blob URLs of the scripts and the WASM it
 // prefetched, so new workers never depend on the local server still being reachable.
-const ASSETS = self.__svAssets || { occt: 'vendor/occt-import-js.js', sw: 'swfile.js', xt: 'xtfile.js', wasm: null };
-importScripts(ASSETS.occt, ASSETS.sw, ASSETS.xt);
+const ASSETS = self.__svAssets || { occt: 'vendor/occt-import-js.js', sw: 'swfile.js', xt: 'xtfile.js', urdf: 'urdffile.js', wasm: null };
+importScripts(ASSETS.occt, ASSETS.sw, ASSETS.xt, ASSETS.urdf);
 
 let occtPromise = null;
 function getOcct() {
@@ -30,6 +30,8 @@ function formatOf(name) {
   if (ext === 'igs' || ext === 'iges') return 'iges';
   if (ext === 'brep' || ext === 'brp') return 'brep';
   if (ext === 'x_t' || ext === 'xmt_txt') return 'parasolid';
+  if (ext === 'urdf') return 'urdf';
+  if (ext === 'stl' || ext === 'obj') return 'mesh';
   return 'step';
 }
 
@@ -259,6 +261,21 @@ onmessage = async (ev) => {
       const tEnd = performance.now();
       postMessage({ id, ok: true, tree: r.tree, meshes: r.meshes, missing: r.missing, usedSiblings: r.usedSiblings, invalidFaces: r.invalidFaces || 0,
         timing: { init: 0, parse: tParse - t0, post: tEnd - tParse } }, transfer);
+      return;
+    }
+    if (formatOf(name) === 'urdf') { // robot: link meshes (no OpenCascade) + kinematic tree
+      const r = await URDFFile.read(bytes, name, (ref) => requestFile(id, ref));
+      const tParse = performance.now();
+      const transfer = finish(r.meshes);
+      postMessage({ id, ok: true, tree: r.tree, meshes: r.meshes, robot: r.robot, missing: r.missing, usedSiblings: r.usedSiblings, warnings: r.warnings,
+        timing: { init: 0, parse: tParse - t0, post: performance.now() - tParse } }, transfer);
+      return;
+    }
+    if (formatOf(name) === 'mesh') {
+      const r = URDFFile.readMeshFile(bytes, name);
+      const tParse = performance.now();
+      const transfer = finish(r.meshes);
+      postMessage({ id, ok: true, tree: r.tree, meshes: r.meshes, timing: { init: 0, parse: tParse - t0, post: performance.now() - tParse } }, transfer);
       return;
     }
     if (formatOf(name) === 'parasolid') {

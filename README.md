@@ -1,6 +1,6 @@
 # StepViewer
 
-A lightweight STEP / IGES / BREP / **SolidWorks (SLDPRT, SLDASM)** / **Parasolid (X_T)** viewer. It runs from a single executable: `dist\StepViewer.exe`.
+A lightweight STEP / IGES / BREP / **SolidWorks (SLDPRT, SLDASM)** / **Parasolid (X_T)** / **URDF robot** / STL viewer. It runs from a single executable: `dist\StepViewer.exe`.
 
 ## Running it
 
@@ -15,7 +15,7 @@ A lightweight STEP / IGES / BREP / **SolidWorks (SLDPRT, SLDASM)** / **Parasolid
 
 The same viewer runs in the browser at **https://david-k6.github.io/StepViewer/** with nothing to install. Files are parsed inside the browser and are never uploaded; parsed models are cached in the browser (IndexedDB).
 
-- Open files with the 열기 button, Ctrl+O or drag and drop. For a SolidWorks assembly, select (or drop) the `.SLDASM` together with its part files, because a web page cannot read the files next to it.
+- Open files with the 열기 button, Ctrl+O or drag and drop. For a SolidWorks assembly, select (or drop) the `.SLDASM` together with its part files, because a web page cannot read the files next to it. The same goes for a `.urdf` and its mesh files.
 - Not available on the web: opening files by double-click / "Open with", and the in-app updater (the web version is always the latest release). The "데스크톱 앱 받기" button links to the exe.
 - On phones (narrower than 820 px, or landscape under 520 px tall) the layout changes: ☰ opens the model tree as a drawer, ⋮ holds quality / update / help, the tools sit in one scrollable row at the bottom and panels become sheets (tap a sheet's title to fold it). One finger rotates, two fingers zoom and pan, a tap selects (tap a selected part again to pick a face, edge or vertex) and a long press opens the menu (hide, rotation center, normal view, DXF).
 - It is published by `.github/workflows/pages.yml` on every push to `main` that touches the app (or run it by hand from the Actions tab).
@@ -42,6 +42,18 @@ Text transmit files (`.x_t`, `.xmt_txt`) from current Onshape, SolidWorks, NX an
 - Each Parasolid body becomes a part. Names and colors come from the file's attributes; `part__body` and `a/b/c` body names become the tree.
 - Checked against STEP exports of the same parts: face count, surface area and bounding box are identical. A 24 MB, 621-body Onshape assembly opens in about 15 s (then from the cache), and every solid in it tessellates closed.
 - Not supported yet: blend (rolling-ball) and spun surfaces; faces on them are skipped with a warning.
+
+## URDF robots (and STL / OBJ)
+
+A `.urdf` opens as a robot whose joints can be moved.
+
+- **Meshes:** STL (binary or ASCII) and OBJ visuals, plus `box`, `cylinder`, `sphere` and `capsule` shapes. Mesh `scale`, visual origins and `<material>` colors (alpha = transparency) are applied; units are converted from meters to mm. Collision geometry is not shown.
+- **Finding the mesh files:** only files below the URDF's parent folder are read (the ROS layout `<pkg>/urdf/x.urdf` + `<pkg>/meshes/`). A `package://my_robot_description/meshes/base.stl` reference is resolved against the folder named like the package first, a relative path (`../meshes/base.stl`) against the URDF's folder; failing that, the bare file name is looked up next to the URDF and in `meshes/` folders. Names must match exactly. In the desktop app the 열기 button (and Ctrl+O) shows the Windows open dialog, so picking the `.urdf` alone is enough; mesh files picked together with it are used too (also from other folders; same-named ones are told apart by their package path). Dropping a file gives no folder, so drop the URDF together with its meshes. In the web version select (or drop) the URDF together with its mesh files; they are matched by file name. Missing meshes are listed in a warning and the rest of the robot still opens.
+- **Joints panel** (⟲ 관절, key J): one slider and number box per movable joint (revolute and continuous in degrees, prismatic in mm), in URDF order. Sliders stop at the URDF limits; "한계 무시" lifts them. `<mimic>` joints follow their master (and stop at their own limits) and are shown greyed out. A joint with `lower` = `upper` stays locked at that value. "초기화" returns to the start pose: every joint at 0, or at the nearest limit when 0 is outside its limits. Hovering a row draws that joint's axis; clicking its name selects everything the joint moves.
+- **Model tree** = kinematic tree (link inside its parent link). Measurement, sections, picking faces/edges and DXF work on the current pose. Picked faces/edges of a link that moves are released; finished measurements stay where they were taken.
+- Mesh triangles are split into faces (planar regions, and smooth regions bounded by edges sharper than 30°), which also gives the CAD edges and smooth shading.
+- Not supported: `.xacro` (run `xacro` first), COLLADA (`.dae`) meshes, `floating` / `planar` joints (shown fixed), closed kinematic loops.
+- A `.stl` or `.obj` file opened on its own becomes a single part, its numbers taken as mm.
 
 ## SolidWorks files (SLDPRT / SLDASM)
 
@@ -78,6 +90,7 @@ npm run xttest -- a.x_t --ref a.step                 # Parasolid reader regressi
 npm run web          # build/web: static web version (what GitHub Pages serves)
 npm run webtest      # headless test of build/web served under /StepViewer/
 npm run mobiletest   # phone/tablet layouts and touch gestures (8 screen sizes, headless Edge)
+npm run urdftest -- robot.urdf   # URDF: loading, forward kinematics vs. an independent computation, joint panel
 ```
 
 Releasing: set `version` in package.json, build, then create a GitHub release whose tag is exactly that version (e.g. `0.0.4`) with the exe attached as `StepViewer.exe`. The in-app updater relies on both. The web version is republished from `main` automatically.

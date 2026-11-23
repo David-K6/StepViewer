@@ -20,7 +20,7 @@
   <button id="btnTree" class="btn icon mob-only" title="모델 트리" aria-label="모델 트리">☰</button>
   <div class="brand">STEP<span>Viewer</span></div>
   <button id="btnOpen" class="btn primary" title="파일 열기 (Ctrl+O)">＋ 열기</button>
-  <input id="fileInput" type="file" multiple accept=".step,.stp,.iges,.igs,.brep,.brp,.sldprt,.sldasm,.x_t,.xmt_txt" hidden>
+  <input id="fileInput" type="file" multiple accept=".step,.stp,.iges,.igs,.brep,.brp,.sldprt,.sldasm,.x_t,.xmt_txt,.urdf,.stl,.obj" hidden>
   <nav id="tabs"></nav>
   <div class="spacer"></div>
   <div id="topExtra" class="topbar-extra">
@@ -80,6 +80,7 @@
         <button class="tool" data-mode="face" title="면 정보: 면적/법선 (G)">▱<small>면</small></button>
       </div>
       <div class="group">
+        <button class="tool hidden" id="btnJoints" title="관절 움직이기 (J)">⟲<small>관절</small></button>
         <button class="tool" id="btnSection" title="단면 보기 (X)">◧<small>단면</small></button>
         <button class="tool" id="btnEdges" title="모서리 표시 (E)">▦<small>모서리</small></button>
         <button class="tool active" id="btnOrigin" title="원점 표시 (O)">⊕<small>원점</small></button>
@@ -135,6 +136,16 @@
       </div>
     </div>
 
+    <div id="jointPanel" class="floating hidden">
+      <div class="panel-head"><span id="jointTitle">관절</span>
+        <div class="row-btns">
+          <label class="muted chk" title="URDF의 관절 한계(limit)를 넘어서 움직일 수 있게 합니다"><input type="checkbox" id="jointFree"> 한계 무시</label>
+          <button class="btn sm" id="btnJointHome" title="모든 관절을 처음 자세로 (0, 한계 밖이면 가까운 한계)">초기화</button>
+        </div>
+      </div>
+      <div id="jointList" class="jlist"></div>
+    </div>
+
     <div id="measurePanel" class="floating hidden">
       <div class="panel-head"><span>측정</span>
         <div class="row-btns">
@@ -150,7 +161,7 @@
       <div class="drop-icon">⬡</div>
       <div class="big desk-only">STEP 파일을 여기에 끌어다 놓으세요</div>
       <div class="big touch-only">파일 열기를 눌러 CAD 파일을 여세요</div>
-      <div class="muted">.step .stp .iges .igs .brep .sldprt .sldasm .x_t · 여러 파일을 동시에 열 수 있습니다</div>
+      <div class="muted">.step .stp .iges .igs .brep .sldprt .sldasm .x_t .urdf .stl · 여러 파일을 동시에 열 수 있습니다</div>
       <button class="btn primary" id="btnOpen2">파일 열기</button>
     </div>
     <div id="loading" class="loading hidden"><div class="spinner"></div><div id="loadingText"></div></div>
@@ -260,6 +271,7 @@
       <tr><td>I</td><td>선택 항목 격리</td></tr>
       <tr><td>S D A R G</td><td>선택 / 거리 / 각도 / 반경 / 면 정보</td></tr>
       <tr><td>X / E / O / P</td><td>단면 / 모서리 / 원점 표시 / 원근·직교</td></tr>
+      <tr><td>J</td><td>URDF 관절 패널: 슬라이더·숫자로 관절 각도(직선 관절은 mm) 변경, 이름 클릭 시 그 관절이 움직이는 부품 선택</td></tr>
       <tr><td>단면 평면 드래그</td><td>단면 패널이 열려 있을 때 파란 평면을 왼쪽 드래그하면 단면 위치 이동</td></tr>
       <tr><td>0 1 3 7 (Ctrl: 반대편)</td><td>등각 / 정면 / 우측 / 평면 뷰</td></tr>
       <tr><td>Ctrl+O / Ctrl+W / Ctrl+Tab</td><td>열기 / 탭 닫기 / 탭 전환</td></tr>
