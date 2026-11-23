@@ -1,13 +1,14 @@
 # StepViewer
 
-A lightweight STEP / IGES / BREP / **SolidWorks (SLDPRT, SLDASM)** / **Parasolid (X_T)** / **URDF robot** / STL viewer. It runs from a single executable: `dist\StepViewer.exe`.
+A lightweight STEP / IGES / BREP / **SolidWorks (SLDPRT, SLDASM)** / **Parasolid (X_T)** / **URDF robot** / STL / OBJ viewer. It runs from a single executable: `dist\StepViewer.exe`. Robot joints can be moved, and agents such as Claude Code can drive the viewer over [MCP](#automation-over-mcp-claude-code-and-other-agents).
 
 ## Running it
 
 - Double-click `dist\StepViewer.exe`. The viewer opens in a frameless Edge (or Chrome) app window. No installation is needed and it works fully offline.
-- `StepViewer.exe a.step b.SLDASM` opens each file in its own tab.
+- `StepViewer.exe a.step b.SLDASM robot.urdf` opens each file in its own tab.
+- "+ 열기" (Ctrl+O) shows the Windows open dialog. Several files can be picked at once; files referenced by an assembly or URDF (its parts / meshes) are read from next to it, so picking the `.SLDASM` or `.urdf` alone is enough.
 - If StepViewer is already running, launching it again opens the new files as tabs in the existing window instead of starting a second copy.
-- To open `.step`, `.sldprt` or `.sldasm` files by double-clicking them, set StepViewer.exe as the default app for that file type in Windows' "Open with" dialog.
+- To open `.step`, `.sldprt`, `.sldasm`, `.x_t`, `.urdf` or `.stl` files by double-clicking them, set StepViewer.exe as the default app for that file type in Windows' "Open with" dialog.
 - StepViewer quits automatically once the last viewer window is closed. The log is written to `%TEMP%\StepViewer.log`.
 - **Updates:** "업데이트 확인" (top right) compares the running version with the latest GitHub release. If a newer one exists, "업데이트" downloads it, replaces `StepViewer.exe` in place and restarts (open files are closed; the window reloads itself). The exe's folder must be writable; otherwise download it from the releases page. Versions before 0.0.4 have no updater, so install 0.0.4 once by hand.
 
@@ -32,6 +33,7 @@ The same viewer runs in the browser at **https://david-k6.github.io/StepViewer/*
 | Section view | X opens the panel. Each of the X, Y and Z planes can be turned on and moved separately (slider, number, or left-drag the blue plane in the view while the panel is open), and you can also define a plane by picking a face. Cut faces are filled solid (stencil caps) and part boundaries on them are drawn as lines. |
 | Measurement | Distance (D), angle (A), radius/diameter (R: click a round edge or a cylindrical / partial cylindrical face, or pick 3 points), face area and normal (G). Snaps to vertices and edges; hold Shift to turn snapping off. Shift+C clears all measurements and the selection. |
 | Pick faces / edges / vertices | Click a selected part again to pick the face, edge or vertex under the cursor (click it again to release it). One pick shows its data: face area and plane normal or cylinder radius, edge length and line direction or arc radius, vertex coordinates. A second pick (on the same part, or on another part selected with Ctrl+click) shows the shortest distance with ΔX/ΔY/ΔZ, the angle between planes or lines, the distance between parallel planes, lines or cylinder axes and between circle centers. "측정에 추가" keeps it in the measurement list; Esc releases the picks. |
+| Robot joints (URDF) | J opens the joint panel: a slider and number box per joint (deg / mm) within the URDF limits, "한계 무시" to lift them, "초기화" for the start pose. Hover a row to see its axis; click a joint name to select what it moves. See [URDF robots](#urdf-robots-and-stl--obj). |
 | Face actions | Right-click a picked face: "면에 수직으로 보기" turns the view to look straight at it. For a plane, "DXF로 내보내기…" writes the face outline seen from its front (LINE / ARC / CIRCLE, holes included) in mm, cm, m, µm, inch or ft to the folder and file name you choose. In the web version the browser's save dialog is used. |
 
 ## Parasolid files (X_T)
@@ -78,6 +80,58 @@ No SolidWorks installation is needed. StepViewer reads the display tessellation 
 - Measured on an AMD Radeon 840M with a 556-part, 440k-triangle assembly: rotation runs at about 60 fps.
 - The first parse of a large STEP file is slow: about 55 s for 30 MB and about 75 s for 78 MB. That time is spent inside OCCT's single-threaded read/transfer stage.
 
+## Automation over MCP (Claude Code and other agents)
+
+`StepViewer.exe --mcp` is an [MCP](https://modelcontextprotocol.io) server on stdin/stdout. An agent can open files, read the model, move robot joints, cut sections and look at the result, in the viewer window on this PC: the user sees everything it does, and the joint panel, tree and sections show the same state.
+
+### Connecting
+
+1. Use a StepViewer that has `--mcp` (this version or later). **Close an older StepViewer that is still running**: the MCP server talks to the running instance, and an older one answers "older version without automation".
+2. Register it with Claude Code (once, for all projects):
+   ```
+   claude mcp add stepviewer -s user -- "C:\path\to\StepViewer.exe" --mcp
+   claude mcp list          # stepviewer: ... - ✓ Connected
+   ```
+   Other MCP clients (Claude Desktop, Cursor, ...): command `C:\path\to\StepViewer.exe`, argument `--mcp`, transport stdio. For example in `claude_desktop_config.json`:
+   ```json
+   { "mcpServers": { "stepviewer": { "command": "C:\\path\\to\\StepViewer.exe", "args": ["--mcp"] } } }
+   ```
+3. In this repository `.mcp.json` already registers the development version (`node server.js --mcp`, from the working tree; run `npm install` and `npm run vendor` once). Claude Code asks once whether to allow it.
+
+If the viewer is not running, the first tool call starts it and opens its window. Commands go to the viewer window the user used last.
+
+### Examples (what to ask the agent)
+
+- "Open C:\robots\hand\hand.urdf and show me all joints with their limits."
+- "Bend index_mcp to 60° and index_pip to 45°, look from the front and take a screenshot."
+- "Open part.step, cut it at x = 12 mm and tell me the bounding box of the bracket."
+- "Close the hand step by step and check that no finger passes its limit."
+
+A typical sequence: `open_files` → `get_joints` → `set_joints` → `set_view` → `screenshot`. Lengths are in mm and angles in degrees, in the model's world coordinates.
+
+### Tools
+
+| Tool | What it does |
+|---|---|
+| `viewer_status` | open tabs: parts, triangles, bounding box (mm), robot joints |
+| `open_files` | open files by absolute path (all formats the viewer opens); referenced parts / meshes are found next to them; rejected paths are listed |
+| `manage_tab` | activate or close a tab (by name or `#index`) |
+| `get_model` | parts (name, URDF link, visibility, selection, triangles, bounding box), with a name filter |
+| `get_joints` | URDF joints: type, value (deg / mm), URDF limits, usable range, home value, parent / child link, axis, mimic |
+| `set_joints` | set several joints at once (`{"index_mcp": 45}`), `reset` to the start pose, `ignore_limits`; values outside the range are clamped and reported; mimic joints follow their master |
+| `set_view` | iso / front / back / left / right / top / bottom / fit, optionally fitted to some parts |
+| `set_visibility` / `select_parts` | show, hide, show only, show all; select (an empty list clears) |
+| `set_section` | section plane normal to x / y / z at a position in mm (flip, caps), or off |
+| `screenshot` | PNG of the 3D view as it is shown (longest side up to 4096 px) |
+
+Every tool takes an optional `tab` (name or `#index`, default: the active tab). Arguments are checked against each tool's schema (unknown or misspelt arguments are refused), and a cancelled call is undone in the viewer (a file still loading is closed).
+
+### How it works / security
+
+- `--mcp` runs a small MCP server (`mcp.js`, embedded in the exe) that finds the running viewer through `%LOCALAPPDATA%\StepViewer\instance.json` and sends each call to the local server's `/api/rpc`. The server passes it to the viewer window over its event stream; the window runs it and posts the result back.
+- The local server only answers requests addressed to `127.0.0.1` / `localhost` (no DNS rebinding), and `/api/rpc` also needs the app's own header, so web pages cannot use it. Files opened over MCP must be absolute paths of supported types that exist.
+- Test: `npm run mcptest -- robot.urdf` (with `MCP_EXE=dist/StepViewer.exe` it tests the built exe).
+
 ## Development
 
 ```
@@ -91,6 +145,7 @@ npm run web          # build/web: static web version (what GitHub Pages serves)
 npm run webtest      # headless test of build/web served under /StepViewer/
 npm run mobiletest   # phone/tablet layouts and touch gestures (8 screen sizes, headless Edge)
 npm run urdftest -- robot.urdf   # URDF: loading, forward kinematics vs. an independent computation, joint panel
+npm run mcptest -- robot.urdf    # MCP server over stdio driving a headless window (MCP_EXE=dist/StepViewer.exe: the exe)
 ```
 
 Releasing: set `version` in package.json, build, then create a GitHub release whose tag is exactly that version (e.g. `0.0.4`) with the exe attached as `StepViewer.exe`. The in-app updater relies on both. The web version is republished from `main` automatically.

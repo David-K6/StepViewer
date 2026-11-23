@@ -24,10 +24,12 @@ try {
   if (!sea.isSea()) sea = null;
 } catch { sea = null; }
 
+const MCP_MODE = process.argv.includes('--mcp'); // stdio MCP server (mcp.js): stdout carries protocol messages only
 function log(...args) {
-  const line = `[${new Date().toISOString()}] ${args.join(' ')}\n`;
+  const line = `[${new Date().toISOString()}] ${MCP_MODE ? '[mcp] ' : ''}${args.join(' ')}\n`;
   try { fs.appendFileSync(LOG_FILE, line); } catch { /* ignore */ }
-  if (!sea) process.stdout.write(line);
+  if (MCP_MODE) process.stderr.write(line);
+  else if (!sea) process.stdout.write(line);
 }
 
 const APP_DIR = path.join(__dirname, 'app');
@@ -465,6 +467,46 @@ function scheduleExitCheck() {
   }, closed ? CLOSE_GRACE_MS : DROP_GRACE_MS);
 }
 
+// ---- automation bridge (MCP, see mcp.js) ----
+// A command goes to the viewer window used last (SSE event "rpc"); the window posts its answer to /api/rpc/result.
+const clientMeta = new Map(); // SSE response -> { cid, used }
+const rpcPending = new Map(); // id -> { res, client, timer, extra }
+let rpcSeq = 0;
+const RPC_RESULT_MAX = 64 * 1048576; // screenshots
+const hostOk = (req) => /^(127\.0\.0\.1|localhost)(:\d+)?$/i.test(req.headers.host || ''); // no DNS rebinding
+function rpcTarget() {
+  let best = null, used = -1;
+  for (const [c, m] of clientMeta) if (m.used >= used) { best = c; used = m.used; }
+  return best;
+}
+let rpcBrowserAt = 0;
+/** the window for a command; with none, one is opened (once for all commands waiting) and awaited */
+async function rpcClient(ms, cancelled) {
+  if (!clients.size && Date.now() - rpcBrowserAt > ms) { rpcBrowserAt = Date.now(); openBrowser(appUrl(serverUrl)); }
+  for (const t0 = Date.now(); !clients.size && !cancelled() && Date.now() - t0 < ms;) await new Promise((r) => setTimeout(r, 200));
+  return rpcTarget();
+}
+function rpcFinish(id, code, body) {
+  const p = rpcPending.get(id);
+  if (!p) return false;
+  rpcPending.delete(id);
+  clearTimeout(p.timer);
+  if (!p.res.writableEnded) json(p.res, code, { ...body, ...(p.extra || {}) });
+  return true;
+}
+/** paths for the "open" command: absolute, an existing regular file of a type the viewer opens */
+function rpcPaths(list) {
+  const ok = [], rejected = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    if (typeof raw !== 'string' || !raw) { rejected.push({ path: String(raw), error: '경로가 아닙니다' }); continue; }
+    if (!path.isAbsolute(raw)) { rejected.push({ path: raw, error: '절대 경로가 필요합니다' }); continue; }
+    if (!STEP_EXT.test(raw)) { rejected.push({ path: raw, error: '지원하지 않는 형식' }); continue; }
+    try { if (!fs.statSync(raw).isFile()) throw new Error(); } catch { rejected.push({ path: raw, error: '파일이 없습니다' }); continue; }
+    ok.push(raw);
+  }
+  return { ok, rejected };
+}
+
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -487,6 +529,9 @@ function createServer(initialIds) {
     const url = new URL(req.url, 'http://localhost');
     const p = decodeURIComponent(url.pathname);
     try {
+      // only pages served as 127.0.0.1 / localhost: a site that rebinds its own name to 127.0.0.1 (DNS rebinding)
+      // gets nothing, so it can neither read files nor join the event stream that carries automation commands
+      if (!hostOk(req)) { res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('forbidden'); }
       if (p === '/favicon.ico') { res.writeHead(204); return res.end(); }
       if (p === '/api/hello') return json(res, 200, { app: APP_ID, pid: process.pid, version: getVersion() });
 
@@ -550,8 +595,54 @@ function createServer(initialIds) {
         }
         const ka = setInterval(() => res.write(': ka\n\n'), 20000);
         const cid = url.searchParams.get('cid') || '';
-        req.on('close', () => { clearInterval(ka); clients.delete(res); lastGoneCid = cid; scheduleExitCheck(); });
+        clientMeta.set(res, { cid, used: Date.now() });
+        req.on('close', () => {
+          clearInterval(ka); clients.delete(res); clientMeta.delete(res); lastGoneCid = cid; scheduleExitCheck();
+          for (const [id, pr] of rpcPending) if (pr.client === res) rpcFinish(id, 502, { ok: false, error: '뷰어 창이 닫혔습니다.' });
+        });
         return;
+      }
+
+      // the window the user touched last receives automation commands (beacon: no custom header possible)
+      if (p === '/api/active' && req.method === 'POST') {
+        const cid = url.searchParams.get('cid') || '';
+        for (const m of clientMeta.values()) if (m.cid === cid) m.used = Date.now();
+        res.writeHead(204); return res.end();
+      }
+
+      // automation: { cmd, args, timeout_ms } -> the window's answer { ok, result | error }
+      if (p === '/api/rpc' && req.method === 'POST') {
+        if (req.headers['x-stepviewer'] !== '1' || !hostOk(req)) return json(res, 403, { ok: false, error: 'forbidden' });
+        const body = JSON.parse(await readBody(req) || '{}');
+        if (typeof body.cmd !== 'string') return json(res, 400, { ok: false, error: 'cmd missing' });
+        let args = body.args && typeof body.args === 'object' && !Array.isArray(body.args) ? body.args : {}, extra = null, okPaths = null;
+        if (body.cmd === 'open') { // the server checks the paths; the window only gets registered file ids
+          const { ok, rejected } = rpcPaths(args.paths);
+          if (!ok.length) return json(res, 200, { ok: false, error: '열 수 있는 파일이 없습니다.', rejected });
+          okPaths = ok;
+          if (rejected.length) extra = { rejected };
+        }
+        // a caller that gives up (MCP request cancelled, client gone) must not have its command run later
+        let gone = false;
+        res.on('close', () => { gone = true; });
+        const client = await rpcClient(30000, () => gone);
+        if (gone) return;
+        if (!client) return json(res, 503, { ok: false, error: '뷰어 창이 열리지 않았습니다.' });
+        if (okPaths) args = { files: registerFiles(okPaths).map(fileInfo) };
+        const id = ++rpcSeq;
+        const ms = Math.max(1000, Math.min(Number(body.timeout_ms) || 120000, 1800000));
+        // the caller gone (or out of time) before the answer: the window drops what the command started
+        const cancel = () => { if (!client.writableEnded) client.write(`event: rpc-cancel\ndata: ${JSON.stringify({ id })}\n\n`); };
+        rpcPending.set(id, { res, client, extra, timer: setTimeout(() => { rpcFinish(id, 504, { ok: false, error: `${ms / 1000}s 안에 응답이 없습니다.` }); cancel(); }, ms) });
+        res.on('close', () => { if (rpcPending.has(id)) { clearTimeout(rpcPending.get(id).timer); rpcPending.delete(id); cancel(); } });
+        client.write(`event: rpc\ndata: ${JSON.stringify({ id, cmd: body.cmd, args })}\n\n`);
+        return;
+      }
+      if (p === '/api/rpc/result' && req.method === 'POST') {
+        if (req.headers['x-stepviewer'] !== '1' || !hostOk(req)) return json(res, 403, { error: 'forbidden' });
+        const body = JSON.parse(await readBody(req, RPC_RESULT_MAX) || '{}');
+        const ok = rpcFinish(body.id, 200, body.ok ? { ok: true, result: body.result } : { ok: false, error: String(body.error || 'failed') });
+        res.writeHead(ok ? 204 : 404); return res.end();
       }
 
       if (p === '/api/bye' && req.method === 'POST') {
@@ -613,7 +704,8 @@ function createServer(initialIds) {
         if (!fp) { res.writeHead(204, { 'Cache-Control': 'no-store' }); return res.end(); } // not an error: optional reference
         const st = fs.statSync(fp);
         res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': st.size, 'Cache-Control': 'no-store', 'X-File-Name': encodeURIComponent(path.basename(fp)) });
-        fs.createReadStream(fp).pipe(res);
+        // pipeline closes the file when the client goes away (cancelled load) or the read fails
+        pipeline(fs.createReadStream(fp), res, (err) => { if (err && err.code !== 'ERR_STREAM_PREMATURE_CLOSE') log('file send', err.message); });
         return;
       }
 
@@ -623,7 +715,8 @@ function createServer(initialIds) {
         if (!fp) return json(res, 404, { error: 'unknown file' });
         const st = fs.statSync(fp);
         res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': st.size, 'Cache-Control': 'no-store' });
-        fs.createReadStream(fp).pipe(res);
+        // pipeline closes the file when the client goes away (cancelled load) or the read fails
+        pipeline(fs.createReadStream(fp), res, (err) => { if (err && err.code !== 'ERR_STREAM_PREMATURE_CLOSE') log('file send', err.message); });
         return;
       }
 
@@ -853,5 +946,31 @@ async function main() {
   }, 120000);
 }
 
+/** `--mcp`: MCP server on stdin/stdout that drives the viewer (started here if needed) through /api/rpc */
+function mcpMain() {
+  let runMcp;
+  if (sea) { // packaged: mcp.js is an embedded asset (only built-in modules)
+    const m = { exports: {} };
+    new Function('module', 'exports', 'require', sea.getAsset('mcp.js', 'utf8'))(m, m.exports, require);
+    runMcp = m.exports;
+  } else runMcp = require('./mcp.js');
+  // STEPVIEWER_MCP_PORT: talk to that (test) instance only and never start one
+  const fixed = Number(process.env.STEPVIEWER_MCP_PORT) || null;
+  let launched = 0;
+  runMcp({
+    version: getVersion(),
+    log,
+    findPort: (p) => findRunning(p ? [p] : fixed ? [fixed] : [PREFERRED_PORT, readInstancePort()]),
+    launch: () => {
+      if (fixed) return false;
+      if (Date.now() - launched < 20000) return true; // one start at a time
+      launched = Date.now();
+      spawn(process.execPath, sea ? [] : [__filename], { detached: true, stdio: 'ignore' }).unref();
+      log('started the viewer');
+      return true;
+    },
+  });
+}
+
 process.on('uncaughtException', (e) => log('uncaught', e && e.stack));
-main();
+if (MCP_MODE) mcpMain(); else main();

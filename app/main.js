@@ -281,7 +281,7 @@ function closeTab(tab) {
   if (i < 0) return;
   tab.closed = true;
   tabs.splice(i, 1);
-  if (tab.loading) pool.cancel(tab);
+  if (tab.loading) { pool.cancel(tab); if (tab.abortLoad) tab.abortLoad(); } // parser job and file downloads
   for (const p of tab.parts) {
     p.mesh.geometry.disposeBoundsTree?.();
     p.mesh.geometry.dispose();
@@ -422,6 +422,7 @@ async function loadBuffer(name, getBuffer, size, resolveFile = null) {
   try {
     const quality = $('quality').value;
     const buffer = await getBuffer(tab);
+    if (tab.closed) return tab; // closed while reading: no hashing, no parsing
     if (!size) size = buffer.byteLength;
     // cache key = file content hash (not name/mtime), so different files can never collide
     const hash = await contentHash(buffer);
@@ -434,13 +435,13 @@ async function loadBuffer(name, getBuffer, size, resolveFile = null) {
     // results depending on other files must never come from the cache (older versions could store them)
     if (result && ((result.missing && result.missing.length) || (result.usedSiblings && result.usedSiblings.length) || !cachedGeometryOk(result))) result = null;
     const fromCache = !!result;
-    if (tab.closed) return;
+    if (tab.closed) return tab;
     if (!result) {
       result = await pool.parse(name, buffer, quality, resolveFile, window.__svParseOpts || {}, tab);
       // results that depend on other files (used or missing ones) change when those files do -> never cache them
       if (cacheKey && !tab.closed && !(result.usedSiblings && result.usedSiblings.length) && !(result.missing && result.missing.length)) cachePut(cacheKey, result);
     }
-    if (tab.closed) return;
+    if (tab.closed) return tab;
     const tParsed = performance.now();
     buildModel(tab, result);
     const tBuilt = performance.now();
@@ -474,13 +475,15 @@ async function loadBuffer(name, getBuffer, size, resolveFile = null) {
     scheduleBvhBuild(tab);
     requestRender();
   } catch (e) {
-    if (tab.closed) return; // closed while loading (job cancelled)
+    if (tab.closed) return tab; // closed while loading (job cancelled)
     console.error(e);
+    tab.loadError = e.message;
     toast(`${name}: ${e.message}`, true);
     closeTab(tab);
   } finally {
     clearInterval(timer);
   }
+  return tab; // closed (and loadError set) when it failed
 }
 
 
@@ -2942,7 +2945,10 @@ function updateStatus() {
 }
 
 let toastTimer = null;
+const toastLog = []; // recent messages (automation results report the ones shown while a command ran)
 function toast(msg, err = false) {
+  toastLog.push({ t: performance.now(), msg, err });
+  if (toastLog.length > 50) toastLog.shift();
   const t = $('toast');
   t.textContent = msg;
   t.classList.toggle('err', err);
@@ -3181,15 +3187,20 @@ function openServerFiles(list) {
   const isRef = (f) => (hasUrdf && MESH_REF.test(f.name)) || (hasAsm && !isAsm(f.name) && !isUrdf(f.name) && !MESH_REF.test(f.name));
   const refs = list.filter(isRef).length;
   if (refs) toast(`${hasUrdf && hasAsm ? 'URDF·조립품' : hasUrdf ? 'URDF' : '조립품'}과 함께 고른 파일 ${refs}개는 참조용으로만 사용합니다.`);
-  for (const f of list.filter((x) => !isRef(x))) {
-    loadBuffer(f.name, async (tab) => {
+  return list.filter((x) => !isRef(x)).map((f) => {
+    // closing the tab (by the user, or a cancelled automation command) stops its downloads too
+    const ctl = new AbortController(), signal = ctl.signal;
+    const get = (u) => fetch(u, { signal });
+    return loadBuffer(f.name, async (tab) => {
+      tab.abortLoad = () => ctl.abort();
       if (f.dir) tab.srcDir = f.dir;
-      const r = await fetch(`/api/file/${f.id}`);
+      const r = await get(`/api/file/${f.id}`);
       if (!r.ok) throw new Error(`파일을 읽을 수 없습니다 (${r.status})`);
       return r.arrayBuffer();
     }, f.size, async (want) => {
+      if (signal.aborted) return null;
       const sibling = async (only) => {
-        const r = await fetch(`/api/sibling/${f.id}?name=${encodeURIComponent(want)}&only=${only}`);
+        const r = await get(`/api/sibling/${f.id}?name=${encodeURIComponent(want)}&only=${only}`);
         return r.status === 200 ? r.arrayBuffer() : null;
       };
       // 1. exactly what the reference names, next to the opened file (package:// and relative paths resolved)
@@ -3198,13 +3209,13 @@ function openServerFiles(list) {
       // 2. the files chosen together (they may sit in a folder the lookup never searches)
       const hit = pickedRef(list, f, want);
       if (hit) {
-        const h = await fetch(`/api/file/${hit.id}`);
+        const h = await get(`/api/file/${hit.id}`);
         if (h.ok) return h.arrayBuffer();
       }
       // 3. only then a file that merely has the same (or a suffixed) name next to the opened one
       return sibling('fallback');
     });
-  }
+  });
 }
 /** the file chosen together with `owner` that a reference means: same name (see matchRefName); among several,
  *  the one whose path ends with most of the reference path (package://pkg/meshes/x.stl), then the owner's folder */
@@ -3429,7 +3440,207 @@ function connectServer() {
   });
   es.addEventListener('openfiles', (ev) => openServerFiles(JSON.parse(ev.data)));
   es.addEventListener('focus', () => window.focus());
+  // automation (MCP): the server sends a command to the window used last, the result goes back by POST
+  const running = new Map(); // command id -> { cancelled, onCancel: [] }
+  es.addEventListener('rpc-cancel', (ev) => { // the caller gave up: undo what the command started (loading tabs)
+    const run = running.get(JSON.parse(ev.data).id);
+    if (!run || run.cancelled) return;
+    run.cancelled = true;
+    for (const f of run.onCancel) f();
+  });
+  es.addEventListener('rpc', async (ev) => {
+    const { id, cmd, args } = JSON.parse(ev.data);
+    const run = { cancelled: false, onCancel: [] };
+    running.set(id, run);
+    let body;
+    try { body = { id, ok: true, result: await runCommand(cmd, args || {}, run) }; } catch (e) { body = { id, ok: false, error: e && e.message ? e.message : String(e) }; }
+    // the command stays cancellable until the server has taken its result: a cancel that crosses the
+    // result on the way, or a result the server no longer waits for (404), undo it the same way
+    if (!run.cancelled) {
+      let taken = false;
+      try {
+        const r = await fetch('/api/rpc/result', { method: 'POST', cache: 'no-store', headers: { 'X-StepViewer': '1', 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        taken = r.status === 204;
+      } catch { /* server gone */ }
+      if (!taken && !run.cancelled) { run.cancelled = true; for (const f of run.onCancel) f(); }
+    }
+    running.delete(id);
+  });
+  const used = () => { try { navigator.sendBeacon(`/api/active?cid=${cid}`); } catch { /* ignore */ } };
+  window.addEventListener('focus', used);
   window.addEventListener('pagehide', () => { try { navigator.sendBeacon(`/api/bye?cid=${cid}`); } catch { /* ignore */ } });
+}
+
+// ---------------------------------------------------------------- automation commands (MCP, see mcp.js)
+// Everything works without animation frames: a minimized window gets none.
+const r3 = (v) => Math.round(v * 1000) / 1000;
+const boxOut = (b) => (b.isEmpty() ? null : { min: b.min.toArray().map(r3), max: b.max.toArray().map(r3), size: b.getSize(new THREE.Vector3()).toArray().map(r3) });
+function cmdTab(sel, needReady = true) {
+  const none = sel === undefined || sel === null || sel === '';
+  let t;
+  if (none) t = active;
+  else if (typeof sel === 'number') t = tabs[sel];
+  else if (/^#\d+$/.test(String(sel))) t = tabs[Number(String(sel).slice(1))];
+  else t = tabs.find((x) => x.name === sel) || tabs.find((x) => x.name.toLowerCase() === String(sel).toLowerCase());
+  if (!t) throw new Error(none ? '열린 탭이 없습니다.' : `탭을 찾을 수 없습니다: ${sel}`);
+  if (needReady && t.loading) throw new Error(`${t.name}: 아직 불러오는 중입니다.`);
+  if (t !== active) activateTab(t);
+  return t;
+}
+function tabSummary(t) {
+  return { index: tabs.indexOf(t), name: t.name, active: t === active, loading: !!t.loading, parts: t.parts.length, triangles: t.triCount,
+    robot: t.robot ? { name: t.robot.name, joints: t.robot.ui.length } : null, box_mm: t.loading ? null : boxOut(t.box),
+    missing: t.missing || [], loadInfo: t.loadInfo || '' };
+}
+function cmdParts(t, names) {
+  if (!Array.isArray(names) || !names.length) throw new Error('parts: 부품(또는 링크) 이름 목록이 필요합니다.');
+  const out = new Set(), unknown = [];
+  for (const n of names) {
+    const hits = t.parts.filter((p) => p.name === n || p.link === n);
+    if (hits.length) hits.forEach((p) => out.add(p)); else unknown.push(n);
+  }
+  if (unknown.length) throw new Error(`없는 부품/링크: ${unknown.join(', ')}`);
+  return [...out];
+}
+function jointOut(R, j) {
+  const [lo, hi] = jointRange(R, j), d = (v) => r3(jointToDisp(j, v));
+  return { name: j.name, type: j.type, unit: j.type === 'prismatic' ? 'mm' : 'deg', value: d(jointValue(j, R)),
+    limits: j.type === 'continuous' ? null : [d(j.lower), d(j.upper)], range: [d(lo), d(hi)], home: d(j.home),
+    parent: j.parent, child: j.child, axis: j.axis.toArray().map(r3),
+    mimic: j.master ? { joint: j.master.name, multiplier: j.mimic.multiplier, offset: d(j.mimic.offset) } : null };
+}
+function screenshot(t, max) {
+  render(performance.now()); // the drawing buffer is readable until this task ends
+  const w0 = canvas.width, h0 = canvas.height, k = Math.min(1, max / Math.max(w0, h0));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w0 * k)); c.height = Math.max(1, Math.round(h0 * k));
+  const g = c.getContext('2d');
+  const bg = g.createLinearGradient(0, 0, 0, c.height); // the viewport's CSS background (style.css #viewport)
+  bg.addColorStop(0, '#3a4250'); bg.addColorStop(1, '#1d2027');
+  g.fillStyle = bg;
+  g.fillRect(0, 0, c.width, c.height);
+  g.drawImage(canvas, 0, 0, c.width, c.height);
+  // the axis triad (its own canvas), where it is shown
+  const vr = canvas.getBoundingClientRect(), tr = triad.getBoundingClientRect(), sx = c.width / (vr.width || 1);
+  if (tr.width) g.drawImage(triad, (tr.left - vr.left) * sx, (tr.top - vr.top) * sx, tr.width * sx, tr.height * sx);
+  requestRender();
+  return { png: c.toDataURL('image/png').split(',')[1], width: c.width, height: c.height, tab: t.name };
+}
+async function runCommand(cmd, a, run = { cancelled: false, onCancel: [] }) {
+  const since = performance.now();
+  const messages = () => toastLog.filter((m) => m.t >= since).map((m) => (m.err ? '⚠ ' : '') + m.msg);
+  switch (cmd) {
+    case 'status':
+      return { tabs: tabs.map(tabSummary), active: active ? tabs.indexOf(active) : null, quality: $('quality').value };
+    case 'open': { // files registered by the server (paths checked there)
+      const before = new Set(tabs);
+      const pending = openServerFiles(a.files || []); // each load creates its tab right away
+      const mine = tabs.filter((t) => !before.has(t));
+      run.onCancel.push(() => { for (const t of mine) if (!t.closed) closeTab(t); }); // cancelled: its tabs go (loading or not)
+      const loads = await Promise.all(pending);
+      return { opened: loads.filter((t) => t && !t.closed).map(tabSummary),
+        failed: loads.filter((t) => t && t.closed && t.loadError).map((t) => ({ name: t.name, error: t.loadError })), messages: messages() };
+    }
+    case 'tab': {
+      if (a.action !== 'activate' && a.action !== 'close') throw new Error("action: 'activate' 또는 'close'");
+      const t = cmdTab(a.tab, false);
+      if (a.action === 'close') { closeTab(t); return { closed: t.name, tabs: tabs.map(tabSummary) }; }
+      return tabSummary(t);
+    }
+    case 'model': {
+      const t = cmdTab(a.tab);
+      const f = a.filter ? String(a.filter).toLowerCase() : '';
+      const list = t.parts.filter((p) => !f || p.name.toLowerCase().includes(f) || (p.link || '').toLowerCase().includes(f));
+      const limit = Math.max(1, Math.min(Number(a.limit) || 200, 2000));
+      return { ...tabSummary(t), matched: list.length, truncated: list.length > limit,
+        parts: list.slice(0, limit).map((p) => ({ name: p.name, link: p.link || undefined, visible: p.visible, selected: t.selection.has(p),
+          triangles: p.triCount, box_mm: boxOut(p.box) })) };
+    }
+    case 'joints': {
+      const t = cmdTab(a.tab);
+      if (!t.robot) throw new Error(`${t.name}: 로봇(URDF) 탭이 아닙니다.`);
+      return { robot: t.robot.name, ignore_limits: t.robot.free, joints: t.robot.ui.map((j) => jointOut(t.robot, j)) };
+    }
+    case 'set_joints': {
+      const t = cmdTab(a.tab), R = t.robot;
+      if (!R) throw new Error(`${t.name}: 로봇(URDF) 탭이 아닙니다.`);
+      const vals = a.values || {};
+      for (const n of Object.keys(vals)) { // check everything before changing anything
+        const j = R.byName.get(n);
+        if (!j || j.type === 'fixed') throw new Error(`움직일 수 있는 관절이 아닙니다: ${n}`);
+        if (j.master) throw new Error(`${n}은(는) mimic 관절입니다 (${j.master.name}을(를) 움직이세요).`);
+        if (typeof vals[n] !== 'number' || !Number.isFinite(vals[n])) throw new Error(`${n}: 숫자가 아닙니다.`);
+      }
+      if (typeof a.ignore_limits === 'boolean' && a.ignore_limits !== R.free) {
+        R.free = a.ignore_limits;
+        if (!R.free) for (const j of R.ui) if (!j.master) setJoint(t, j, j.value); // same rule as the checkbox
+        if (t === active) renderJointPanel();
+      }
+      if (a.reset) for (const j of R.joints) j.value = j.home;
+      const clamped = [];
+      for (const [n, v] of Object.entries(vals)) {
+        const j = R.byName.get(n);
+        if (R.free) j.value = jointFromDisp(j, v); // limits lifted: taken as given (the slider range is only the UI's)
+        else setJoint(t, j, jointFromDisp(j, v));
+        const got = r3(jointToDisp(j, j.value));
+        if (Math.abs(got - v) > 1e-3) clamped.push({ joint: n, requested: v, applied: got });
+      }
+      poseRobot(t);
+      if (t === active) syncJointValues();
+      return { joints: R.ui.map((j) => jointOut(R, j)), clamped, box_mm: boxOut(t.box) };
+    }
+    case 'view': {
+      const t = cmdTab(a.tab);
+      const name = a.view || 'iso';
+      if (name !== 'fit' && !VIEWS[name]) throw new Error(`view: ${Object.keys(VIEWS).join(', ')}, fit 중 하나`);
+      const list = a.parts && a.parts.length ? cmdParts(t, a.parts) : (name === 'fit' && t.selection.size ? [...t.selection] : t.parts);
+      const dir = name === 'fit' ? t.camera.position.clone().sub(t.target).normalize() : new THREE.Vector3(...VIEWS[name]).normalize();
+      syncCameraAspect(t);
+      const f = fitParams(t, visibleBox(t, list), dir);
+      animateCamera(t, f.pos, f.target, f.zoom, 0, name === 'fit' ? null : Z_UP);
+      controls.update();
+      return { view: name, tab: t.name };
+    }
+    case 'visibility': {
+      const t = cmdTab(a.tab);
+      const act = a.action || 'show';
+      if (act === 'all') setVisible(t, t.parts, true);
+      else {
+        const list = cmdParts(t, a.parts);
+        if (act === 'show') setVisible(t, list, true);
+        else if (act === 'hide') setVisible(t, list, false);
+        else if (act === 'only') { const keep = new Set(list); setVisible(t, t.parts.filter((p) => !keep.has(p)), false); setVisible(t, list, true); }
+        else throw new Error('action: show, hide, only, all 중 하나');
+      }
+      return { visible: t.parts.filter((p) => p.visible).length, parts: t.parts.length };
+    }
+    case 'select': {
+      const t = cmdTab(a.tab);
+      selectParts(a.parts && a.parts.length ? cmdParts(t, a.parts) : []);
+      return { selected: [...t.selection].map((p) => p.name) };
+    }
+    case 'section': {
+      const t = cmdTab(a.tab), S = t.section;
+      if (a.axis === 'off') { for (const k of ['x', 'y', 'z', 'c']) S[k].on = false; }
+      else {
+        if (!['x', 'y', 'z'].includes(a.axis)) throw new Error("axis: 'x', 'y', 'z' 또는 'off'");
+        const st = S[a.axis], wasOn = st.on;
+        st.on = a.enabled !== false;
+        if (typeof a.position_mm === 'number' && Number.isFinite(a.position_mm)) st.pos = a.position_mm;
+        if (typeof a.flip === 'boolean') st.flip = a.flip; else if (st.on && !wasOn) st.flip = autoFlip(t, a.axis);
+      }
+      if (typeof a.caps === 'boolean') S.caps = a.caps;
+      applySection(t);
+      syncSectionUI();
+      const ax = (k) => ({ on: S[k].on, position_mm: r3(S[k].pos), flip: S[k].flip, range_mm: axisRange(t, k).map(r3) });
+      return { x: ax('x'), y: ax('y'), z: ax('z'), caps: S.caps };
+    }
+    case 'screenshot': {
+      const t = cmdTab(a.tab);
+      return screenshot(t, Math.max(64, Math.min(Number(a.max_size) || 1280, 4096)));
+    }
+    default: throw new Error(`알 수 없는 명령: ${cmd}`);
+  }
 }
 connectServer();
 
