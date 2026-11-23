@@ -1,6 +1,6 @@
 {
   "name": "stepviewer",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Lightweight STEP/IGES viewer (single exe)",
   "main": "server.js",
   "scripts": {

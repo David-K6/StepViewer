@@ -77,6 +77,21 @@ const check = (cond, msg, extra = '') => { console.log(`${cond ? 'PASS' : 'FAIL'
         'SolidWorks assembly + its parts selected together open as assembly tabs', JSON.stringify(r));
     }
 
+    // a URDF selected together with its mesh files (WEBTEST_URDF=<folder>, default testfiles/urdf): one robot tab
+    const urdfDir = process.env.WEBTEST_URDF ? path.resolve(process.env.WEBTEST_URDF) : path.join(root, 'testfiles', 'urdf');
+    if (fs.existsSync(urdfDir)) {
+      const all = fs.readdirSync(urdfDir).filter((f) => /\.(urdf|stl|obj)$/i.test(f)).map((f) => path.join(urdfDir, f));
+      const k = await ev(() => window.__sv.tabs.length);
+      await (await page.$('#fileInput')).uploadFile(...all);
+      await page.waitForFunction((k) => window.__sv.tabs.length > k && !window.__sv.tabs.some((t) => t.loading), { timeout: 300000 }, k);
+      const r = await ev((k) => window.__sv.tabs.slice(k).map((t) => ({ name: t.name, parts: t.parts.length, joints: t.robot ? t.robot.ui.length : 0, missing: t.missing.length })), k);
+      check(r.length === 1 && r[0].joints > 0 && r[0].missing === 0, 'URDF + its meshes selected together open as one robot tab', JSON.stringify(r));
+    }
+    // the 열기 button of the web version is the browser's file input (no native dialog through the server)
+    const chooser = page.waitForFileChooser({ timeout: 5000 }).then(() => true, () => false);
+    await page.click('#btnOpen');
+    check(await chooser, '열기 opens the browser file chooser');
+
     check(!requests.some((u) => u.includes('/api/')), 'no requests to the local-server API', requests.filter((u) => u.includes('/api/')).join(' '));
     check(requests.every((u) => u.startsWith(BASE)), 'every asset is loaded relative to the sub path', requests.filter((u) => !u.startsWith(BASE)).join(' '));
     check(errors.length === 0, 'no console errors', errors.slice(0, 5).join(' | '));
