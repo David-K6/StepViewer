@@ -410,6 +410,112 @@ function dxfLoops(text, scale = 1) {
     check(synth.coneFit === null, 'a very flat cone (0.57°) is not taken for a cylinder');
     await shot('6-synthetic');
 
+    // ---- STL: ASCII with two solids (a block and a 64-sided pin) through the real worker
+    {
+      const stlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sv-stl-'));
+      const tri = [];
+      const quad = (a, b, c, d) => tri.push([a, b, c], [a, c, d]);
+      const B = [[0, 0, 0], [20, 0, 0], [20, 10, 0], [0, 10, 0], [0, 0, 5], [20, 0, 5], [20, 10, 5], [0, 10, 5]];
+      quad(B[0], B[3], B[2], B[1]); quad(B[4], B[5], B[6], B[7]); quad(B[0], B[1], B[5], B[4]); quad(B[1], B[2], B[6], B[5]); quad(B[2], B[3], B[7], B[6]); quad(B[3], B[0], B[4], B[7]);
+      const block = tri.splice(0);
+      for (let i = 0; i < 64; i++) {
+        const a0 = (i / 64) * 2 * Math.PI, a1 = ((i + 1) / 64) * 2 * Math.PI;
+        const p = (a, z) => [40 + 5 * Math.cos(a), 5 * Math.sin(a), z];
+        quad(p(a0, 0), p(a1, 0), p(a1, 20), p(a0, 20));
+        tri.push([[40, 0, 0], p(a1, 0), p(a0, 0)], [[40, 0, 20], p(a0, 20), p(a1, 20)]);
+      }
+      const solid = (name, ts) => [`solid ${name}`, ...ts.flatMap((t) => ['facet normal 0 0 0', 'outer loop', ...t.map((v) => `vertex ${v.join(' ')}`), 'endloop', 'endfacet']), `endsolid ${name}`].join('\n');
+      const stlFile = path.join(stlDir, 'parts.stl');
+      fs.writeFileSync(stlFile, solid('block', block) + '\n' + solid('pin', tri) + '\n');
+      const nT = await ev(() => window.__sv.tabs.length);
+      await (await page.$('#fileInput')).uploadFile(stlFile);
+      await page.waitForFunction((n) => window.__sv.tabs.length > n && !window.__sv.tabs.some((t) => t.loading), { timeout: 60000 }, nT);
+      const st = await ev(() => {
+        const sv = window.__sv, t = sv.active, V = sv.THREE.Vector3;
+        const face = (part, f) => ({ kind: 'face', part, f, key: 'f' + f, viewNormal: new V(0, 0, 1), point: new V() });
+        const parts = t.parts.map((p) => ({ name: p.name, faces: p.faceFirst.length, edges: p.edges.length / 6 }));
+        const blk = t.parts[0], pin = t.parts[1];
+        const top = [...Array(blk.faceFirst.length).keys()].map((f) => sv.faceData(blk, f)).find((d) => d.planar && d.normal.z > 0.99);
+        const ol = top && sv.faceOutline(t, face(blk, top.f));
+        const side = [...Array(pin.faceFirst.length).keys()].find((f) => !sv.faceData(pin, f).planar);
+        const sd = side !== undefined && sv.faceData(pin, side);
+        const fit = sd && sv.fitCylinderFace(t, { part: pin, tri: sd.first, point: new V().fromArray(sd.tri, 0) });
+        return { name: t.name, parts, topArea: top && top.area, outline: ol && ol.ents.map((e) => e.t).join(','), dxf: ol ? sv.dxfText(ol, 'mm') : '', r: fit && fit.radius, len: fit && fit.length, info: t.loadInfo || '' };
+      });
+      check(JSON.stringify(st.parts.map((p) => [p.name, p.faces])) === '[["block",6],["pin",3]]', 'STL: one part per solid, faces found from the triangles (block 6, pin 3)', JSON.stringify(st.parts));
+      check(st.parts[0].edges === 12 && st.parts[1].edges === 128, 'STL: CAD-like edges only on creases (block 12, pin 2×64 rim segments)', JSON.stringify(st.parts.map((p) => p.edges)));
+      check(Math.abs(st.topArea - 200) < 1e-6 && st.outline === 'line,line,line,line', 'STL: planar face area and DXF outline (4 lines)', `${st.topArea} ${st.outline}`);
+      const dl = dxfLoops(st.dxf);
+      check(dl && Math.abs(dl.area - 200) < 1e-6, 'STL: DXF text of the face is a closed 20×10 loop', JSON.stringify(dl));
+      check(st.r && Math.abs(st.r - 5) < 0.01 && Math.abs(st.len - 20) < 1e-3, 'STL: radius of the 64-sided pin side face', `R ${st.r} L ${st.len}`);
+      // the same binary STL under two names: each tab's part is named after its own file (not the cached one)
+      const bin = Buffer.alloc(84 + 50); bin.writeUInt32LE(1, 80); [0, 0, 0, 1, 0, 0, 0, 1, 0].forEach((v, k) => bin.writeFloatLE(v, 96 + k * 4));
+      const names = [];
+      for (const n of ['alpha.stl', 'beta.stl']) {
+        fs.writeFileSync(path.join(stlDir, n), bin);
+        const k = await ev(() => window.__sv.tabs.length);
+        await (await page.$('#fileInput')).uploadFile(path.join(stlDir, n));
+        await page.waitForFunction((c) => window.__sv.tabs.length > c && !window.__sv.tabs.some((t) => t.loading), { timeout: 60000 }, k);
+        names.push(await ev(() => window.__sv.active.parts.map((p) => p.name).join()));
+      }
+      check(names.join('|') === 'alpha|beta', 'STL: identical binary files under different names keep their own part names', names.join('|'));
+      // flat sides meeting a fillet tangentially (all edges under 30°) stay faces of their own: picking, area, DXF
+      // (two 20×10 strips joined by an R1 quarter bend of 6 facets)
+      const bend = [];
+      const bq = (a, b, c, d) => bend.push([a, b, c], [a, c, d]);
+      const arc = (k, y) => { const a = ((k / 6) * Math.PI) / 2; return [20 + Math.sin(a), y, 1 - Math.cos(a)]; };
+      bq([0, 0, 0], [20, 0, 0], [20, 10, 0], [0, 10, 0]);
+      for (let k = 0; k < 6; k++) bq(arc(k, 0), arc(k + 1, 0), arc(k + 1, 10), arc(k, 10));
+      bq([21, 0, 1], [21, 0, 21], [21, 10, 21], [21, 10, 1]);
+      fs.writeFileSync(path.join(stlDir, 'rounded.stl'), solid('rounded', bend) + '\n');
+      {
+        const k = await ev(() => window.__sv.tabs.length);
+        await (await page.$('#fileInput')).uploadFile(path.join(stlDir, 'rounded.stl'));
+        await page.waitForFunction((c) => window.__sv.tabs.length > c && !window.__sv.tabs.some((t) => t.loading), { timeout: 60000 }, k);
+      }
+      const rb = await ev(() => {
+        const sv = window.__sv, t = sv.active, V = sv.THREE.Vector3, p = t.parts[0];
+        const ds = [...Array(p.faceFirst.length).keys()].map((f) => sv.faceData(p, f));
+        const flats = ds.filter((d) => d.planar).map((d) => {
+          const ol = sv.faceOutline(t, { kind: 'face', part: p, f: d.f, key: 'f' + d.f, viewNormal: new V(d.normal.x, d.normal.y, d.normal.z), point: new V() });
+          return { area: d.area, dxf: ol ? sv.dxfText(ol, 'mm') : '' };
+        });
+        return { faces: ds.length, curved: ds.filter((d) => !d.planar).map((d) => d.area), flats };
+      });
+      const rl = rb.flats.map((f) => dxfLoops(f.dxf));
+      check(rb.faces === 3 && rb.flats.length === 2 && rb.flats.every((f) => Math.abs(f.area - 200) < 1e-6) && rb.curved.length === 1 && Math.abs(rb.curved[0] - 15.66314) < 1e-3,
+        'STL: flat sides next to a tangent fillet stay their own faces (2 × 200 mm² + the fillet)', JSON.stringify({ faces: rb.faces, flats: rb.flats.map((f) => f.area), curved: rb.curved }));
+      check(rl.length === 2 && rl.every((l) => l && l.loops === 1 && !l.openLoops && Math.abs(l.area - 200) < 1e-6), 'STL: each of those flat faces exports a closed 20×10 DXF outline', JSON.stringify(rl));
+      // a collinear facet along the crease of two faces, reaching 40 mm past it: not drawn, not in the DXF, not in the
+      // bounds; and an extreme thin triangle (corner at 1e17) measures its real 0.5 mm² in the viewer
+      const binStl = (tris) => { const n = tris.length / 9, b = Buffer.alloc(84 + n * 50); b.writeUInt32LE(n, 80); tris.forEach((v, k) => b.writeFloatLE(v, 84 + Math.floor(k / 9) * 50 + 12 + (k % 9) * 4)); return b; };
+      const cq = [[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]], vq = [[0, 0, 0], [0, 0, 5], [10, 0, 5], [10, 0, 0]];
+      fs.writeFileSync(path.join(stlDir, 'collinear.stl'), binStl([...cq[0], ...cq[2], ...cq[1], ...cq[0], ...cq[3], ...cq[2], ...vq[0], ...vq[1], ...vq[2], ...vq[0], ...vq[2], ...vq[3], 0, 0, 0, 10, 0, 0, 50, 0, 0]));
+      const M17 = Math.fround(1e17);
+      fs.writeFileSync(path.join(stlDir, 'thin.stl'), binStl([M17, M17, 0, 1, 0, 0, 2, 1, 0]));
+      const extra = {};
+      for (const n of ['collinear.stl', 'thin.stl']) {
+        const k = await ev(() => window.__sv.tabs.length);
+        await (await page.$('#fileInput')).uploadFile(path.join(stlDir, n));
+        await page.waitForFunction((c) => window.__sv.tabs.length > c && !window.__sv.tabs.some((t) => t.loading), { timeout: 60000 }, k);
+        extra[n] = await ev(() => {
+          const sv = window.__sv, t = sv.active, V = sv.THREE.Vector3, p = t.parts[0];
+          const ds = [...Array(p.faceFirst.length).keys()].map((f) => sv.faceData(p, f));
+          const flat = ds.find((d) => d.planar && Math.abs(d.normal.z) > 0.99);
+          const ol = flat && sv.faceOutline(t, { kind: 'face', part: p, f: flat.f, key: 'f' + flat.f, viewNormal: new V(flat.normal.x, flat.normal.y, flat.normal.z), point: new V() });
+          const size = p.box.getSize(new V());
+          return { faces: ds.length, edges: p.edges.length / 6, diag: size.length(), area: flat && flat.area, normalZ: flat && flat.normal.z,
+            lines: ol ? ol.ents.length : 0, dxf: ol ? sv.dxfText(ol, 'mm') : '' };
+        });
+      }
+      const ce = extra['collinear.stl'], cl = dxfLoops(ce.dxf), th = extra['thin.stl'];
+      check(ce.faces === 2 && Math.abs(ce.diag - 15) < 1e-9 && ce.lines === 4 && cl && cl.loops === 1 && !cl.openLoops && Math.abs(cl.area - 100) < 1e-9,
+        'STL: a collinear facet along a crease is not drawn, exported or counted in the bounds', JSON.stringify({ faces: ce.faces, edges: ce.edges, diag: ce.diag, lines: ce.lines, loops: cl }));
+      check(th.faces === 1 && Math.abs(th.area - 0.5) < 1e-9 && Math.abs(Math.abs(th.normalZ) - 1) < 1e-9, 'STL: an extreme thin triangle (corner at 1e17) measures 0.5 mm² with a ±Z normal in the viewer', JSON.stringify({ area: th.area, normalZ: th.normalZ }));
+      fs.rmSync(stlDir, { recursive: true, force: true });
+      await ev(() => window.__sv.closeTab && window.__sv.closeTab(window.__sv.active));
+    }
+
     // ---- Parasolid X_T + face/edge/vertex picking, pair measurement, normal view, DXF export
     const xtFile = path.join(root, 'testfiles', 'xt', 'lens mount_261022 - Part 1.x_t');
     if (fs.existsSync(xtFile)) {
@@ -613,6 +719,34 @@ function dxfLoops(text, scale = 1) {
     const geo = await ev(() => window.__sv.renderer.info.memory.geometries);
     const keep = await ev(() => window.__sv.persistentGeometries);
     check(geo <= baseGeo + keep, 'no GPU geometry left after closing all tabs', `${geo} (baseline ${baseGeo} + ${keep} origin marker)`);
+    // the last tab closed: nothing of it may stay on screen (tab bar, model tree, panels), the start screen shows
+    const closedUI = () => ev(() => ({
+      tabs: document.querySelectorAll('#tabs .tab').length,
+      empty: !document.getElementById('empty').classList.contains('hidden'),
+      tree: document.querySelectorAll('#tree .tnode').length,
+      props: document.getElementById('props').classList.contains('hidden'),
+      measures: document.querySelectorAll('#measureList .mitem').length,
+      entity: document.getElementById('entityPanel').classList.contains('hidden'),
+      loading: document.getElementById('loading').classList.contains('hidden'),
+      status: document.getElementById('stFile').textContent,
+    }));
+    const isClosed = (u) => !u.tabs && u.empty && !u.tree && u.props && !u.measures && u.entity && u.loading && u.status === '파일 없음';
+    let ui = await closedUI();
+    check(isClosed(ui), 'closing the last tab clears the tab bar, model tree and panels and shows the start screen', JSON.stringify(ui));
+    // ... also when it is closed (× button) while still loading, and nothing comes back once the cancelled load ends
+    const bigFile = path.join(root, 'testfiles', 'UM2_1546-A.STEP');
+    if (fs.existsSync(bigFile)) {
+      await (await page.$('#fileInput')).uploadFile(bigFile);
+      await page.waitForFunction(() => window.__sv.tabs.length === 1, { timeout: 30000 });
+      const wasLoading = await ev(() => window.__sv.tabs[0].loading);
+      await page.click('#tabs .tab .x');
+      await wait(300);
+      const now = await closedUI();
+      await wait(3000);
+      ui = await closedUI();
+      check(wasLoading && isClosed(now) && isClosed(ui) && !(await ev(() => window.__sv.tabs.length)), 'closing the last tab while it loads (× button) closes it for good',
+        JSON.stringify({ wasLoading, now, later: ui }));
+    }
     // once the server is gone, the event stream's reconnect attempts fail by design
     const real = errors.filter((x) => !(serverGone && /ERR_CONNECTION_(REFUSED|RESET)/.test(x)));
     check(real.length === 0, 'no console errors', real.join(' | '));

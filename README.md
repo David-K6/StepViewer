@@ -55,7 +55,18 @@ A `.urdf` opens as a robot whose joints can be moved.
 - **Model tree** = kinematic tree (link inside its parent link). Measurement, sections, picking faces/edges and DXF work on the current pose. Picked faces/edges of a link that moves are released; finished measurements stay where they were taken.
 - Mesh triangles are split into faces (planar regions, and smooth regions bounded by edges sharper than 30°), which also gives the CAD edges and smooth shading.
 - Not supported: `.xacro` (run `xacro` first), COLLADA (`.dae`) meshes, `floating` / `planar` joints (shown fixed), closed kinematic loops.
-- A `.stl` or `.obj` file opened on its own becomes a single part, its numbers taken as mm.
+- A `.obj` file opened on its own becomes a single part, its numbers taken as mm. For a `.stl` file see [STL files](#stl-files).
+- STL meshes are parsed by the same reader as standalone STL files, so damaged ones (truncated, incomplete facets, NaN coordinates) are skipped with a warning instead of shown half-read.
+
+## STL files
+
+- Binary and ASCII STL open directly. An ASCII file with several `solid … endsolid` blocks gives one part per block, named after the block; a binary file is one part named after the file.
+- Binary files whose 80-byte header starts with `solid` (SolidWorks and others write that) and binary files with bytes after the last triangle are recognised as binary. Truncated files, facets without exactly 3 vertices and NaN coordinates are reported as errors.
+- STL has no units: values are taken as millimeters (what almost every CAD exporter writes).
+- STL has no faces or edges either, so StepViewer derives them. Connected triangles whose normals turn by at most 30° across their shared edge form a smooth region. Inside it, a flat patch covering at least a fifth of the region stays a face of its own (a flat side meeting a fillet tangentially, two flat sides at a shallow angle); the rest becomes curved faces. Flat sides and finely faceted curved surfaces (a cylinder or fillet exported with many facets) each become one face, and the borders between faces are drawn as edges. Face, edge and vertex picking, measuring, radius, normal view and DXF export then work as for CAD files.
+- Touching coplanar faces merge into one. A curved surface with only a few facets in its region (about 5 or fewer) shows them as flat faces, and a cylinder exported with fewer than 12 facets keeps one face per facet (30° creases). A triangle belongs to a flat patch when its normal is within 0.26° of the patch's (as in 0.0.7), wherever the part is and however finely it is cut up. So a lightly warped face stays one flat face, flat faces meeting at a larger shallow angle stay apart, and a two-triangle face warped by more than 0.26° comes back as two flat faces. A small flat side beside a fillet (under a fifth of the smooth region) merges into the fillet's face, as in 0.0.7.
+- Damaged meshes: an edge shared by more than 8 triangles (stacked duplicate facets, for example) joins none of them into a face, and a solid without any triangle area (collinear corners only) is left out. Zero-area triangles (repeated or collinear corners) are left out entirely, as in 0.0.7: they are not drawn, picked, exported to DXF or counted in the bounds, and they do not join the faces around them.
+- STL files carry no colors in the standard, so parts are shown in the default gray.
 
 ## SolidWorks files (SLDPRT / SLDASM)
 
@@ -141,6 +152,7 @@ npm run build        # dist/StepViewer.exe (Node SEA, GUI subsystem)
 npm run smoke -- testfiles/x.stp   # headless Edge test with assertions
 npm run swtest -- a.SLDASM --pair p.SLDPRT=p.step   # SolidWorks reader regression test
 npm run xttest -- a.x_t --ref a.step                 # Parasolid reader regression test
+npm run stltest                                      # STL reader regression test (STEP models round-tripped through STL, URDF meshes)
 npm run web          # build/web: static web version (what GitHub Pages serves)
 npm run webtest      # headless test of build/web served under /StepViewer/
 npm run mobiletest   # phone/tablet layouts and touch gestures (8 screen sizes, headless Edge)

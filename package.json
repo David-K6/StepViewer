@@ -14,6 +14,7 @@
     "webtest": "node scripts/webtest.js",
     "xttest": "node scripts/xttest.js",
     "mobiletest": "node scripts/mobiletest.js",
+    "stltest": "node scripts/stltest.js",
     "urdftest": "node scripts/urdftest.js",
     "mcptest": "node scripts/mcptest.js"
   },

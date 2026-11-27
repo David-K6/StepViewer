@@ -74,14 +74,15 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
       check(inside(tb), tag('toolbar inside the screen'), JSON.stringify(tb));
       // every tool can be reached by scrolling the row
       await ev(() => { const t = document.getElementById('toolbar'); t.scrollLeft = t.scrollWidth; });
-      await wait(150);
+      // the fade classes follow the scroll event: wait for them (not a fixed delay)
+      await page.waitForFunction(() => { const t = document.getElementById('toolbar'); return t.scrollWidth <= t.clientWidth || t.classList.contains('more-left'); }, { timeout: 3000 }).catch(() => {});
       const reach = await ev(() => {
         const t = document.getElementById('toolbar');
         const last = [...t.querySelectorAll('.group')].pop().getBoundingClientRect();
         return { ok: last.right <= window.innerWidth + 0.5 && last.left >= 0, fade: t.classList.contains('more-left') || t.scrollWidth <= t.clientWidth, scrolls: t.scrollWidth > t.clientWidth };
       });
       await ev(() => { document.getElementById('toolbar').scrollLeft = 0; });
-      await wait(150);
+      await page.waitForFunction(() => { const t = document.getElementById('toolbar'); return t.scrollWidth <= t.clientWidth || t.classList.contains('more-right'); }, { timeout: 3000 }).catch(() => {});
       const fadeRight = await ev(() => document.getElementById('toolbar').classList.contains('more-right'));
       check(reach.ok && reach.fade && (!reach.scrolls || fadeRight), tag('every tool reachable; the scrolling row shows a faded edge'), JSON.stringify({ ...reach, fadeRight }));
       await shot('1-model');
@@ -137,11 +138,14 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
         await tap(target.x, target.y);
         check((await ev(() => window.__sv.active.selection.size)) === 1, tag('tap selects the part'));
         await tap(target.x, target.y);
+        await page.waitForFunction(() => (window.__sv.active.entities || []).length > 0, { timeout: 3000 }).catch(() => {});
         const ent = await ev(() => (window.__sv.active.entities || []).map((e) => e.kind));
+        const picked = ent.length === 1 && ent[0] === 'face';
         const sheet = await rect('#entityPanel'), bar = await rect('#toolbar');
         check(ent.length === 1 && ent[0] === 'face' && inside(sheet) && !overlap(sheet, bar), tag('second tap picks the face; its sheet fits above the toolbar'), JSON.stringify({ ent, sheet: sheet && [Math.round(sheet.y), Math.round(sheet.b)], bar: bar && Math.round(bar.y) }));
         await shot('5-picked');
-        if (compact) {
+        // the steps below that need the picked face are skipped when the tap above missed (its check is the result)
+        if (compact && picked) {
           await tapSel('#entityPanel .panel-head > span');
           const folded = await rect('#entityPanel');
           const bodyShown = await ev(() => getComputedStyle(document.getElementById('entityBody')).display !== 'none');
@@ -156,13 +160,14 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
           const kb3 = await ev(() => document.getElementById('entityPanel').classList.contains('collapsed'));
           check(kb.role === 'button' && kb.tab === 0 && kb.focused && kb.exp === 'true' && kb2.exp === 'false' && kb2.folded && !kb3, tag('sheet title works from a keyboard (Enter / Space, aria-expanded)'), JSON.stringify({ kb, kb2, kb3 }));
         }
-        // one-finger drag rotates and never taps
+        // one-finger drag rotates and never taps (the selection stays what it was)
         const cam0 = await ev(() => window.__sv.active.camera.position.toArray());
+        const sel0 = await ev(() => ({ sel: window.__sv.active.selection.size, ents: window.__sv.active.entities.length }));
         await touch('touchStart', [[target.x, target.y]]);
         for (let k = 1; k <= 8; k++) { await touch('touchMove', [[target.x + k * 12, target.y + k * 4]]); await wait(16); }
         await touch('touchEnd', []); await wait(250);
         const afterDrag = await ev(() => ({ cam: window.__sv.active.camera.position.toArray(), sel: window.__sv.active.selection.size, ents: window.__sv.active.entities.length }));
-        check(afterDrag.cam.some((v, i) => Math.abs(v - cam0[i]) > 1e-6) && afterDrag.sel === 1 && afterDrag.ents === 1, tag('one-finger drag rotates without selecting'), JSON.stringify({ sel: afterDrag.sel, ents: afterDrag.ents }));
+        check(afterDrag.cam.some((v, i) => Math.abs(v - cam0[i]) > 1e-6) && afterDrag.sel === sel0.sel && afterDrag.ents === sel0.ents, tag('one-finger drag rotates without selecting'), JSON.stringify({ sel: afterDrag.sel, ents: afterDrag.ents }));
         // two-finger pinch zooms and never taps
         await ev(() => window.__sv.setView(window.__sv.active, 'iso', false)); await wait(200);
         const z0 = await ev(() => { const t = window.__sv.active; return t.camera.position.distanceTo(t.target) / t.camera.zoom; });
@@ -172,7 +177,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
         for (let k = 1; k <= 8; k++) { await touch('touchMove', [[cx - 30 - k * 10, cy], [cx + 30 + k * 10, cy]]); await wait(16); }
         await touch('touchEnd', []); await wait(250);
         const afterPinch = await ev(() => { const t = window.__sv.active; return { z: t.camera.position.distanceTo(t.target) / t.camera.zoom, sel: t.selection.size, ents: t.entities.length }; });
-        check(afterPinch.z < z0 * 0.95 && afterPinch.sel === 1 && afterPinch.ents === 1, tag('pinch zooms in without selecting'), `${z0.toFixed(2)} -> ${afterPinch.z.toFixed(2)}`);
+        check(afterPinch.z < z0 * 0.95 && afterPinch.sel === sel0.sel && afterPinch.ents === sel0.ents, tag('pinch zooms in without selecting'), `${z0.toFixed(2)} -> ${afterPinch.z.toFixed(2)}`);
         // long press = right click: menu inside the screen, rotation center from it
         await frame();
         await touch('touchStart', [[target.x, target.y]]); await wait(750); await touch('touchEnd', []); await wait(150);
@@ -190,14 +195,16 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
         const treePivot = await ev(() => ({ open: !document.getElementById('ctxMenu').classList.contains('hidden'), pivot: !document.querySelector('#ctxMenu [data-act="pivot"]').disabled }));
         await ev(() => document.getElementById('ctxMenu').classList.add('hidden'));
         check(treePivot.open && !treePivot.pivot, tag('tree menu offers no stale rotation center'), JSON.stringify(treePivot));
-        // DXF dialog fits
-        await ev(() => { const sv = window.__sv; sv.openDxfDialog(sv.active, sv.actionFace(sv.active)); });
-        await wait(200);
-        const dxf = await rect('#dxfDlg .modal-body');
-        const fontPx = await ev(() => parseFloat(getComputedStyle(document.getElementById('dxfName')).fontSize));
-        check(inside(dxf) && (!compact || fontPx >= 16), tag('DXF dialog fits the screen (inputs ≥ 16 px on phones)'), `${JSON.stringify(dxf && [Math.round(dxf.x), Math.round(dxf.y), Math.round(dxf.r), Math.round(dxf.b)])} font ${fontPx}`);
-        await shot('7-dxf');
-        await tapSel('#btnDxfClose');
+        // DXF dialog fits (needs the face picked above)
+        if (picked) {
+          await ev(() => { const sv = window.__sv; return sv.openDxfDialog(sv.active, sv.actionFace(sv.active)); });
+          await wait(200);
+          const dxf = await rect('#dxfDlg .modal-body');
+          const fontPx = await ev(() => parseFloat(getComputedStyle(document.getElementById('dxfName')).fontSize));
+          check(inside(dxf) && (!compact || fontPx >= 16), tag('DXF dialog fits the screen (inputs ≥ 16 px on phones)'), `${JSON.stringify(dxf && [Math.round(dxf.x), Math.round(dxf.y), Math.round(dxf.r), Math.round(dxf.b)])} font ${fontPx}`);
+          await shot('7-dxf');
+          await tapSel('#btnDxfClose');
+        }
         await ev(() => window.__sv.setEntities(window.__sv.active, []));
       }
       // ---- section panel

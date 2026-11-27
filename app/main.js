@@ -58,10 +58,10 @@ const workerAssetsReady = (async () => {
       if (!r.ok) throw new Error(`${u}: ${r.status}`);
       return URL.createObjectURL(new Blob([await r.arrayBuffer()], { type }));
     };
-    const [occt, sw, xt, urdf, wasm, wk] = await Promise.all([
+    const [occt, sw, xt, stl, urdf, wasm, wk] = await Promise.all([
       blobUrl('vendor/occt-import-js.js', 'text/javascript'), blobUrl('swfile.js', 'text/javascript'), blobUrl('xtfile.js', 'text/javascript'),
-      blobUrl('urdffile.js', 'text/javascript'), blobUrl('vendor/occt-import-js.wasm', 'application/wasm'), blobUrl('worker.js', 'text/javascript')]);
-    const boot = `self.__svAssets=${JSON.stringify({ occt, sw, xt, urdf, wasm })};importScripts(${JSON.stringify(wk)});`;
+      blobUrl('stlfile.js', 'text/javascript'), blobUrl('urdffile.js', 'text/javascript'), blobUrl('vendor/occt-import-js.wasm', 'application/wasm'), blobUrl('worker.js', 'text/javascript')]);
+    const boot = `self.__svAssets=${JSON.stringify({ occt, sw, xt, stl, urdf, wasm })};importScripts(${JSON.stringify(wk)});`;
     workerUrl = URL.createObjectURL(new Blob([boot], { type: 'text/javascript' }));
   } catch (e) { console.warn('[StepViewer] worker prefetch failed, using the server copy', e); }
 })();
@@ -243,8 +243,9 @@ function renderTabs() {
   $('empty').classList.toggle('hidden', tabs.length > 0);
 }
 
-function activateTab(tab) {
-  if (active === tab) return;
+/** @param force also when tab is already active (closeTab: no tab left takes over the screen) */
+function activateTab(tab, force = false) {
+  if (active === tab && !force) return;
   closeContextMenu();
   if (camAnim) { camAnim.step(Infinity); camAnim = null; }
   if (active) {
@@ -281,23 +282,27 @@ function closeTab(tab) {
   if (i < 0) return;
   tab.closed = true;
   tabs.splice(i, 1);
-  if (tab.loading) { pool.cancel(tab); if (tab.abortLoad) tab.abortLoad(); } // parser job and file downloads
-  for (const p of tab.parts) {
-    p.mesh.geometry.disposeBoundsTree?.();
-    p.mesh.geometry.dispose();
-    p.material.dispose();
+  try {
+    if (tab.loading) { pool.cancel(tab); if (tab.abortLoad) tab.abortLoad(); } // parser job and file downloads
+    for (const p of tab.parts) {
+      p.mesh.geometry.disposeBoundsTree?.();
+      p.mesh.geometry.dispose();
+      p.material.dispose();
+    }
+    for (const e of tab.edgeObjs) { e.geometry.dispose(); e.material.dispose(); }
+    for (const m of tab.measures) disposeMeasure(m);
+    if (tab.pending) { disposeMeasure(tab.pending); tab.pending = null; }
+    if (tab.entGroup) { clearGroup(tab.entGroup); clearGroup(tab.entHoverGroup); tab.entities = []; }
+    for (const p of tab.parts) disposeFaceCache(p);
+    if (tab.robot) showJointAxis(tab, null);
+    disposeSectionObjs(tab);
+    tab.scene.clear(); tab.overlay.clear();
+  } finally {
+    // the screen always moves on, even if releasing something failed. With no tab left, activateTab(null) must
+    // still run (tab bar, start screen, tree, panels, loading cover), so the "already active" shortcut is skipped
+    if (active === tab) { active = null; activateTab(tabs[Math.min(i, tabs.length - 1)] || null, true); }
+    else renderTabs();
   }
-  for (const e of tab.edgeObjs) { e.geometry.dispose(); e.material.dispose(); }
-  for (const m of tab.measures) disposeMeasure(m);
-  if (tab.pending) { disposeMeasure(tab.pending); tab.pending = null; }
-  if (tab.entGroup) { clearGroup(tab.entGroup); clearGroup(tab.entHoverGroup); tab.entities = []; }
-  for (const p of tab.parts) disposeFaceCache(p);
-  if (tab.robot) showJointAxis(tab, null);
-  disposeSectionObjs(tab);
-  tab.scene.clear(); tab.overlay.clear();
-  if (active === tab) { active = null; activateTab(tabs[Math.min(i, tabs.length - 1)] || null); }
-  else renderTabs();
-  if (!tabs.length) { renderTree(); updateStatus(); }
 }
 
 // ---------------------------------------------------------------- loading
@@ -429,7 +434,8 @@ async function loadBuffer(name, getBuffer, size, resolveFile = null) {
     const popt = window.__svParseOpts && Object.keys(window.__svParseOpts).length ? '|' + JSON.stringify(window.__svParseOpts) : '';
     // v3: entries written by older versions (no corrupted-face filtering, cached partial assemblies) are ignored
     // sw2: SolidWorks results carry the files' appearance colors; v4: OpenCascade colors are converted to sRGB
-    const fmtVer = /\.sld(prt|asm)$/i.test(name) ? 'sw2|' : /\.(x_t|xmt_txt)$/i.test(name) ? 'xt1|' : /\.(stl|obj|urdf)$/i.test(name) ? 'mesh1|' : '';
+    // stl6: STL read by stlfile.js (flat patches kept beside fillets and at shallow angles); part names come from the file name, so it is in the key
+    const fmtVer = /\.sld(prt|asm)$/i.test(name) ? 'sw2|' : /\.(x_t|xmt_txt)$/i.test(name) ? 'xt1|' : /\.stl$/i.test(name) ? `stl6|${encodeURIComponent(name)}|` : /\.(obj|urdf)$/i.test(name) ? 'mesh1|' : '';
     const cacheKey = hash ? `v4|${fmtVer}${quality}${popt}|${buffer.byteLength}|${hash}` : null;
     let result = cacheKey ? await cacheGet(cacheKey) : null;
     // results depending on other files must never come from the cache (older versions could store them)
@@ -1665,6 +1671,40 @@ const entPtHoverMat = new THREE.PointsMaterial({ color: ENT_COLOR, size: 9, size
 const ENT_SHARED_MATS = new Set([entLineMat, entLineHoverMat, entPtMat, entPtHoverMat, lineMat, ptMat, dashMat]);
 
 /** triangles, area, centroid and plane of one B-rep face (cached on the part) */
+// exact arithmetic on float32 values: every finite float32 times 2^149 is an integer
+const F32_SCALE = 2 ** 149, F32_SCALE2 = 2 ** 298, F32_SPLIT = 134217729;
+const xInt = (x) => BigInt(x * F32_SCALE);
+const diffExact = (a, b, d) => { const bv = d - a, av = d - bv; return (a - av) + (-b - bv) === 0; }; // Knuth two-sum error 0
+function prodExact(a, b, x) { // Dekker two-product error 0
+  let c = F32_SPLIT * a;
+  const ah = c - (c - a), al = a - ah;
+  c = F32_SPLIT * b;
+  const bh = c - (c - b), bl = b - bh;
+  return al * bl - (((x - ah * bh) - al * bh) - ah * bl) === 0;
+}
+/** u_i v_j - u_j v_i with u = s - o, v = e - o (offsets into p); sign and zero always exact, as stlfile.js crossComp */
+function crossComp(p, o, s, e, i, j, ui, vj, uj, vi) {
+  const x = ui * vj, y = uj * vi, r = x - y;
+  if (!(x || y) || Math.abs(r) > 1e-14 * (Math.abs(x) + Math.abs(y))) return r;
+  if (diffExact(p[s + i], p[o + i], ui) && diffExact(p[e + j], p[o + j], vj) && diffExact(p[s + j], p[o + j], uj)
+    && diffExact(p[e + i], p[o + i], vi) && prodExact(ui, vj, x) && prodExact(uj, vi, y)) return r;
+  if (!(p instanceof Float32Array)) return r;
+  const oi = xInt(p[o + i]), oj = xInt(p[o + j]);
+  return Number((xInt(p[s + i]) - oi) * (xInt(p[e + j]) - oj) - (xInt(p[s + j]) - oj) * (xInt(p[e + i]) - oi)) / F32_SCALE2;
+}
+const dist2 = (p, i, j) => (p[i] - p[j]) ** 2 + (p[i + 1] - p[j + 1]) ** 2 + (p[i + 2] - p[j + 2]) ** 2;
+/** cross product of a triangle (twice its area, along its normal) into the Vector3 out, robust for extreme slivers
+ *  (the same as stlfile.js cross3): from the corner opposite the longest edge, sign and zero of each component exact.
+ *  a, b, c are offsets into p (vertex index * 3) */
+function triCross(p, a, b, c, out) {
+  const ab = dist2(p, a, b), bc = dist2(p, b, c), ca = dist2(p, c, a);
+  let o = a, s = b, e = c;
+  if (!(bc >= ab && bc >= ca)) { if (ca >= ab) { o = b; s = c; e = a; } else { o = c; s = a; e = b; } }
+  const ux = p[s] - p[o], uy = p[s + 1] - p[o + 1], uz = p[s + 2] - p[o + 2];
+  const vx = p[e] - p[o], vy = p[e + 1] - p[o + 1], vz = p[e + 2] - p[o + 2];
+  return out.set(crossComp(p, o, s, e, 1, 2, uy, vz, uz, vy), crossComp(p, o, s, e, 2, 0, uz, vx, ux, vz), crossComp(p, o, s, e, 0, 1, ux, vy, uy, vx));
+}
+
 function faceData(part, f) {
   part.faceCache ||= new Map();
   let d = part.faceCache.get(f);
@@ -1679,7 +1719,7 @@ function faceData(part, f) {
   let area = 0, planar = true, o = 0;
   for (let t = first; t <= last; t++) {
     A.fromArray(pos, idx[t * 3] * 3); B.fromArray(pos, idx[t * 3 + 1] * 3); C.fromArray(pos, idx[t * 3 + 2] * 3);
-    cr.crossVectors(_v1.copy(B).sub(A), _v2.copy(C).sub(A));
+    triCross(pos, idx[t * 3] * 3, idx[t * 3 + 1] * 3, idx[t * 3 + 2] * 3, cr);
     const ar = cr.length() / 2;
     if (ar > 0) {
       nSum.add(cr);
@@ -2239,6 +2279,7 @@ const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return nu
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* ignore */ } };
 function dxfMsg(text, kind = '') { const m = $('dxfMsg'); m.textContent = text; m.classList.toggle('err', kind === 'err'); m.classList.toggle('ok', kind === 'ok'); }
 async function openDxfDialog(tab, ent) {
+  if (!tab || !ent) return; // nothing picked (the menu item is off then; automation may still call it)
   const outline = faceOutline(tab, ent);
   if (!outline) { toast('평면이 아닌 면은 DXF로 내보낼 수 없습니다.', true); return; }
   dxfJob = { tab, ent, outline };

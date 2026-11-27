@@ -3,8 +3,8 @@
 /* global occtimportjs */
 // When started from a blob (see main.js), the page hands over blob URLs of the scripts and the WASM it
 // prefetched, so new workers never depend on the local server still being reachable.
-const ASSETS = self.__svAssets || { occt: 'vendor/occt-import-js.js', sw: 'swfile.js', xt: 'xtfile.js', urdf: 'urdffile.js', wasm: null };
-importScripts(ASSETS.occt, ASSETS.sw, ASSETS.xt, ASSETS.urdf);
+const ASSETS = self.__svAssets || { occt: 'vendor/occt-import-js.js', sw: 'swfile.js', xt: 'xtfile.js', stl: 'stlfile.js', urdf: 'urdffile.js', wasm: null };
+importScripts(ASSETS.occt, ASSETS.sw, ASSETS.xt, ASSETS.stl, ASSETS.urdf); // urdffile.js reads STL meshes with stlfile.js
 
 let occtPromise = null;
 function getOcct() {
@@ -31,7 +31,8 @@ function formatOf(name) {
   if (ext === 'brep' || ext === 'brp') return 'brep';
   if (ext === 'x_t' || ext === 'xmt_txt') return 'parasolid';
   if (ext === 'urdf') return 'urdf';
-  if (ext === 'stl' || ext === 'obj') return 'mesh';
+  if (ext === 'stl') return 'stl';
+  if (ext === 'obj') return 'mesh';
   return 'step';
 }
 
@@ -269,6 +270,13 @@ onmessage = async (ev) => {
       const transfer = finish(r.meshes);
       postMessage({ id, ok: true, tree: r.tree, meshes: r.meshes, robot: r.robot, missing: r.missing, usedSiblings: r.usedSiblings, warnings: r.warnings,
         timing: { init: 0, parse: tParse - t0, post: performance.now() - tParse } }, transfer);
+      return;
+    }
+    if (formatOf(name) === 'stl') { // triangle soup: no OpenCascade; one part per ASCII solid
+      const r = STLFile.read(bytes, name);
+      const tParse = performance.now();
+      const transfer = finish(r.meshes);
+      postMessage({ id, ok: true, tree: r.tree, meshes: r.meshes, stl: r.stats, timing: { init: 0, parse: tParse - t0, post: performance.now() - tParse } }, transfer);
       return;
     }
     if (formatOf(name) === 'mesh') {

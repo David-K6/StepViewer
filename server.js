@@ -69,7 +69,7 @@ function getBuildId() {
   if (buildId) return buildId;
   if (!sea) return (buildId = 'dev');
   const h = crypto.createHash('sha1').update(getVersion());
-  for (const f of ['index.html', 'main.js', 'worker.js', 'swfile.js', 'xtfile.js', 'urdffile.js', 'style.css', 'vendor/three.module.js', 'vendor/three.core.js',
+  for (const f of ['index.html', 'main.js', 'worker.js', 'swfile.js', 'xtfile.js', 'stlfile.js', 'urdffile.js', 'style.css', 'vendor/three.module.js', 'vendor/three.core.js',
     'vendor/three-mesh-bvh.module.js', 'vendor/occt-import-js.js', 'vendor/addons/OrbitControls.js', 'vendor/addons/CSS2DRenderer.js']) {
     const b = getAsset(f);
     h.update(f).update(b || '');

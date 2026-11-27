@@ -197,27 +197,13 @@
   }
 
   // ------------------------------------------------------------------ mesh files -> triangle soups (meters)
+  // STL parsing is shared with standalone .stl files (stlfile.js): binary/ASCII detection (binary headers that start
+  // with "solid", trailing bytes), and truncated, incomplete or NaN files are reported instead of shown half-read
+  const stlReader = () => G.STLFile || (typeof require === 'function' ? require('./stlfile.js') : null);
   function readStl(bytes) {
-    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    if (bytes.byteLength >= 84) {
-      const n = dv.getUint32(80, true);
-      if (84 + n * 50 === bytes.byteLength) {
-        const out = new Float32Array(n * 9);
-        for (let t = 0; t < n; t++) {
-          const o = 84 + t * 50 + 12;
-          for (let k = 0; k < 9; k++) out[t * 9 + k] = dv.getFloat32(o + k * 4, true);
-        }
-        return out;
-      }
-    }
-    const text = new TextDecoder().decode(bytes);
-    if (!/^\s*solid/i.test(text) || !/facet/i.test(text)) throw new Error('STL 형식이 아니거나 손상되었습니다.');
-    const v = [];
-    const re = /vertex\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)/g;
-    let m;
-    while ((m = re.exec(text))) v.push(+m[1], +m[2], +m[3]);
-    const n = Math.floor(v.length / 9);
-    return Float32Array.from(v.slice(0, n * 9));
+    const STL = stlReader();
+    if (!STL) throw new Error('STL 리더(stlfile.js)를 불러오지 못했습니다.');
+    return STL.soup(bytes);
   }
   /** planar polygon (3D points, in order) -> triangles, ear clipping in its own plane (concave polygons are fine) */
   function triangulate(poly) {
